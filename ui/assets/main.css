@@ -1,0 +1,68 @@
+html,
+body,
+#__nuxt {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  background: var(--p-content-background);
+  color: var(--p-text-color);
+}
+
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.muted {
+  color: var(--p-text-muted-color);
+}
+
+.fill {
+  height: 100%;
+  min-height: 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Tabs fill the window and their panels scroll on their own */
+.p-tabs.workpanel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.p-tabs.workpanel > .p-tabpanels {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0;
+}
+.p-tabs.workpanel > .p-tabpanels > .p-tabpanel {
+  height: 100%;
+}
+
+.panel-pad {
+  padding: 0.75rem 1rem;
+  box-sizing: border-box;
+}
+
+.p-datatable .p-datatable-tbody > tr {
+  cursor: pointer;
+}

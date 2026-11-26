@@ -1,0 +1,35 @@
+# Console-style logging: self.log / info / warn / error / debug take any values; log_table shows rows.
+package logging_demo
+
+class Order:
+    string id
+    string customer
+    float total
+    boolean paid
+
+step load_orders(int n)(Order orders[]):
+    customers = ["ada", "bob", "cy"]
+    orders = [Order(id=f"A{100 + i}", customer=customers[i % 3], total=round((19.5 * (i + 1)) % 97, 2),
+                    paid=i % 4 != 0) for i in range(n)]
+    self.log("loaded", len(orders), "orders; first:", orders[0])
+    self.log_table(orders)
+    return orders
+
+step check(Order orders[])(int unpaid):
+    late = [o.id for o in orders if not o.paid]
+    if late:
+        self.warn(len(late), "unpaid orders:", late)
+    totals = {c: round(sum(o.total for o in orders if o.customer == c), 2) for c in ("ada", "bob", "cy")}
+    self.debug("totals by customer", totals)
+    self.log_table(totals)
+    self.info("summary", {"count": len(orders), "unpaid": len(late), "flags": {"ok": not late, "ids": late[:3]}})
+    if len(late) > len(orders) // 2:
+        self.error("more than half of the orders are unpaid")
+    return len(late)
+
+flow main(int n)(int unpaid):
+    Order orders[]
+    int u
+    orders = load_orders(n)
+    u = check(orders)
+    return u

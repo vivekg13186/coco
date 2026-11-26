@@ -1,0 +1,12 @@
+package hello
+import math
+
+step greet(string name, int times)(string message, float root):
+    self.log("greeting", name, times, "time(s)")
+    return ", ".join([f"Hello, {name}!"] * times), math.sqrt(times)
+
+flow main(string name)(string message):
+    string m
+    float r
+    (m, r) = greet(name, 2)
+    return m
