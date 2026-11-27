@@ -7,7 +7,7 @@ name = "coco-core"
 version = "0.1.0"
 description = "Coco workflow language: parser, checker and runtime"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.5"]
+dependencies = ["pydantic>=2.5", "requests>=2.31"]  # requests: ready for HTTP calls in steps
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff", "mypy"]

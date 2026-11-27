@@ -279,25 +279,28 @@ Input:
 { "raw": "[{\"city\": \"Amsterdam\", \"temp\": 7.5}, {\"city\": \"Utrecht\", \"temp\": 8.1}]" }
 ```
 
-To use a package from PyPI, install it into the same virtual environment as the engine, then restart
-`coco-server`:
-
-```bash
-source .venv/bin/activate
-pip install requests
-```
+[`requests`](https://requests.readthedocs.io) comes installed with Coco, so steps can call HTTP APIs
+right away:
 
 ```python
 import requests
 
-from coco import step
+from coco import step, env
 
 
 @step
-def fetch(url: str) -> dict:
-    response = requests.get(url, timeout=10)
+def fetch(path: str) -> dict:
+    response = requests.get(env.api.base_url + path, timeout=10)
     response.raise_for_status()
     return response.json()
+```
+
+To use any other package from PyPI, install it into the same virtual environment as the engine, then
+restart `coco-server`:
+
+```bash
+source .venv/bin/activate
+pip install pandas
 ```
 
 You can also import another workflow by its name (`import shared`), call its steps and flows from a flow
