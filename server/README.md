@@ -11,14 +11,14 @@ source .venv/bin/activate
 pip install -e "core[dev]" -e "server[dev]"
 
 coco-server                         # http://127.0.0.1:8765, db at ~/.coco/coco.db, API docs at /docs
-                                    # serves the UI at / once it is built (cd ui && npm install && npm run build)
+                                    # serves the web UI at / (the build committed in coco_server/ui)
 coco-server --db ./coco.db --port 8765 --max-runs 4
 pytest core server
 ```
 
 Settings come from flags or environment variables: `COCO_DB`, `COCO_HOST`, `COCO_PORT`, `COCO_MAX_RUNS`
 (default 4), `COCO_API_TOKEN` (off by default; when set, send `Authorization: Bearer <token>` or `?token=`),
-`COCO_EVENT_RETENTION_DAYS` (default 90), `COCO_UI_DIR` (default `ui/.output/public` in the repo).
+`COCO_EVENT_RETENTION_DAYS` (default 90), `COCO_UI_DIR` (default: the built UI shipped in `coco_server/ui`, refreshed by `npm run build` in `ui/`).
 
 ## Try it with curl
 

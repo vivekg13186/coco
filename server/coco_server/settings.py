@@ -13,10 +13,14 @@ def _int(name: str, default: int) -> int:
 
 
 def _default_ui_dir() -> str | None:
-    """The built UI in the repo (`ui/.output/public`), when it exists."""
+    """The built UI: the copy shipped inside this package (`coco_server/ui`, kept in git), or else a local
+    build in the repo (`ui/.output/public`)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.normpath(os.path.join(here, "..", "..", "ui", ".output", "public"))
-    return path if os.path.isfile(os.path.join(path, "index.html")) else None
+    for path in (os.path.join(here, "ui"),
+                 os.path.normpath(os.path.join(here, "..", "..", "ui", ".output", "public"))):
+        if os.path.isfile(os.path.join(path, "index.html")):
+            return path
+    return None
 
 
 @dataclass

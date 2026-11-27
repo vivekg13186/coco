@@ -2,17 +2,22 @@
 
 The Coco WorkPanel (milestone 3): Nuxt 3 single-page app with PrimeVue 4 (Aura theme) and Monaco.
 
-## Build it and use it through the engine
+## The built UI lives in git
+
+You do not need Node.js to use Coco: the built UI is committed at `server/coco_server/ui/` and ships inside
+the `coco-server` package, so `pip install` plus `coco-server` is enough.
+
+When you change anything in `ui/`, rebuild and commit the result together with your source change:
 
 ```bash
-cd ~/Developer/coco/ui
-npm install
-npm run build          # writes .output/public; coco-server serves it automatically
-cd .. && coco-server   # open http://127.0.0.1:8765/
+cd ui
+npm install            # once
+npm run build          # nuxt generate, then copies .output/public to server/coco_server/ui/
+cd .. && git add ui server/coco_server/ui
 ```
 
-`coco-server` looks for `ui/.output/public` next to the server package; point `COCO_UI_DIR` elsewhere if you
-move it.
+`.gitattributes` marks `server/coco_server/ui/` as generated, so its minified files stay out of `git diff`
+and GitHub's language stats. `COCO_UI_DIR` points the engine at another build if you need to.
 
 ## Develop it
 

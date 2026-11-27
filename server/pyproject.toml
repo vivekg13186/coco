@@ -18,5 +18,8 @@ coco-server = "coco_server.main:main"
 [tool.setuptools.packages.find]
 include = ["coco_server*"]
 
+[tool.setuptools.package-data]
+coco_server = ["ui/*", "ui/**/*"]  # the built web UI (npm run build in ui/ refreshes it)
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
