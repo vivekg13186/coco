@@ -45,15 +45,16 @@ function onJson(name: string, text: string) {
       <label :for="`in-${p.name}`" class="row">
         <span class="name">{{ p.name }}</span>
         <Tag :value="p.type" severity="secondary" class="type" />
+        <span v-if="p.optional" class="muted opt">optional</span>
       </label>
-      <InputText v-if="p.type === 'string'" :id="`in-${p.name}`" :model-value="modelValue[p.name] ?? ''" fluid
+      <InputText v-if="baseType(p.type) === 'str'" :id="`in-${p.name}`" :model-value="modelValue[p.name] ?? ''" fluid
                  @update:model-value="v => set(p.name, v)" />
-      <InputNumber v-else-if="p.type === 'int'" :input-id="`in-${p.name}`" :model-value="modelValue[p.name] ?? 0"
+      <InputNumber v-else-if="baseType(p.type) === 'int'" :input-id="`in-${p.name}`" :model-value="modelValue[p.name] ?? 0"
                    :use-grouping="false" fluid @update:model-value="v => set(p.name, v ?? 0)" />
-      <InputNumber v-else-if="p.type === 'float'" :input-id="`in-${p.name}`" :model-value="modelValue[p.name] ?? 0"
+      <InputNumber v-else-if="baseType(p.type) === 'float'" :input-id="`in-${p.name}`" :model-value="modelValue[p.name] ?? 0"
                    :use-grouping="false" :min-fraction-digits="0" :max-fraction-digits="10" fluid
                    @update:model-value="v => set(p.name, v ?? 0)" />
-      <ToggleSwitch v-else-if="p.type === 'boolean'" :input-id="`in-${p.name}`" :model-value="!!modelValue[p.name]"
+      <ToggleSwitch v-else-if="baseType(p.type) === 'bool'" :input-id="`in-${p.name}`" :model-value="!!modelValue[p.name]"
                     @update:model-value="v => set(p.name, v)" />
       <template v-else>
         <Textarea :id="`in-${p.name}`" :model-value="jsonText[p.name]" class="json-field" rows="5" auto-resize fluid
@@ -77,6 +78,9 @@ function onJson(name: string, text: string) {
 }
 .name {
   font-weight: 600;
+}
+.opt {
+  font-size: 11px;
 }
 .type {
   font-size: 11px;

@@ -1,32 +1,38 @@
 import type * as Monaco from 'monaco-editor'
 import type { Diagnostic, Signature, Symbols } from '~/types/api'
+import { signature } from '~/utils/format'
 
-// The `coco` language for Monaco: highlighting for Coco and the Python inside steps,
-// editing rules, completion and hover from the engine's /validate symbols, and markers.
+// The `coco` language for Monaco: a workflow file is plain Python, so this is Python highlighting plus
+// completion and hover from the engine's /validate symbols (steps, flows, classes, coco globals) and markers.
 
-const COCO_KEYWORDS = ['package', 'import', 'from', 'as', 'class', 'step', 'flow', 'if', 'elif', 'else', 'for', 'in', 'return']
-const PY_KEYWORDS = [
-  'and', 'or', 'not', 'is', 'while', 'break', 'continue', 'pass', 'def', 'lambda', 'try', 'except', 'finally',
-  'raise', 'with', 'yield', 'del', 'global', 'nonlocal', 'assert', 'async', 'await',
+const KEYWORDS = [
+  'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except',
+  'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass',
+  'raise', 'return', 'try', 'while', 'with', 'yield', 'match', 'case',
 ]
-const TYPES = ['string', 'boolean', 'int', 'float', 'object', 'array']
+const TYPES = ['str', 'int', 'float', 'bool', 'dict', 'list', 'tuple', 'set', 'Any', 'Optional', 'Model']
 const BUILTINS = [
-  'len', 'min', 'max', 'abs', 'round', 'sum', 'str', 'bool', 'sorted', 'list', 'range', 'print', 'dict', 'set',
-  'tuple', 'enumerate', 'zip', 'isinstance', 'map', 'filter', 'any', 'all', 'open', 'repr', 'type',
+  'len', 'min', 'max', 'abs', 'round', 'sum', 'sorted', 'range', 'print', 'enumerate', 'zip', 'isinstance', 'map',
+  'filter', 'any', 'all', 'open', 'repr', 'type', 'reversed', 'getattr', 'hasattr', 'super',
 ]
-const SELF_MEMBERS: { label: string; insert: string; doc: string }[] = [
-  { label: 'log', insert: 'log(${1:values})', doc: 'Log any number of values, like console.log: `self.log("total", n, data, True)`. Objects show as expandable trees.' },
+// what `from coco import ...` gives a workflow; also available without importing
+const GLOBALS: { label: string; insert: string; doc: string }[] = [
+  { label: 'log', insert: 'log(${1:values})', doc: 'Log any number of values, like console.log: `log("total", n, data, True)`. Objects show as expandable trees. Works in steps and flows.' },
   { label: 'info', insert: 'info(${1:values})', doc: 'Log at info level (same as `log`).' },
   { label: 'warn', insert: 'warn(${1:values})', doc: 'Log a warning, highlighted in the run viewer.' },
   { label: 'error', insert: 'error(${1:values})', doc: 'Log an error, highlighted in the run viewer. Does not stop the step: raise an exception for that.' },
   { label: 'debug', insert: 'debug(${1:values})', doc: 'Log at debug level (dimmed; can be filtered out).' },
   { label: 'log_table', insert: 'log_table(${1:rows})', doc: 'Log rows as a table, like console.table: a list of objects, lists or values, or a dict of rows. Optional `columns=["a", "b"]`. The viewer can sort and filter it.' },
-  { label: 'env', insert: 'env', doc: 'The run environment (read-only): `self.env.api_url`, `self.env["api_url"]`, `self.env.get("k", default)`.' },
-  { label: 'run_id', insert: 'run_id', doc: 'Id of the current run.' },
-  { label: 'flow', insert: 'flow', doc: 'Name of the top-level flow.' },
-  { label: 'step', insert: 'step', doc: 'Name of this step.' },
-  { label: 'path', insert: 'path', doc: 'Node path of this call, e.g. onboard/for#0[2]/enrich.' },
+  { label: 'env', insert: 'env', doc: 'The run environment (read-only): `env.api_url`, `env["api_url"]`, `env.get("k", default)`.' },
+  { label: 'context', insert: 'context', doc: 'Where the code runs: `context.run_id`, `context.flow`, `context.step`, `context.path`.' },
 ]
+const CONTEXT_MEMBERS: { label: string; doc: string }[] = [
+  { label: 'run_id', doc: 'Id of the current run.' },
+  { label: 'flow', doc: 'Name of the top-level flow.' },
+  { label: 'step', doc: 'Name of the running step (None in a flow).' },
+  { label: 'path', doc: 'Node path of this call, e.g. onboard/for#0[2]/enrich.' },
+]
+const GLOBAL_NAMES = GLOBALS.map(g => g.label)
 
 const symbolsByModel = new Map<string, Symbols>()
 let registered = false
@@ -67,50 +73,51 @@ export function setDiagnostics(monaco: typeof Monaco, model: Monaco.editor.IText
 }
 
 function sigText(kind: string, s: Signature) {
-  const p = (xs: { name: string; type: string }[]) => xs.map(x => `${x.type} ${x.name}`).join(', ')
-  return `${kind} ${s.name}(${p(s.inputs)})(${p(s.outputs)})`
+  return `@${kind}\ndef ${s.name}${signature(s)}`
 }
 
 function callSnippet(s: Signature) {
-  return `${s.name}(${s.inputs.map((p, i) => `\${${i + 1}:${p.name}}`).join(', ')})`
+  const required = s.inputs.filter(p => !p.optional)
+  return `${s.name}(${required.map((p, i) => `\${${i + 1}:${p.name}}`).join(', ')})`
 }
 
 export function registerCoco(monaco: typeof Monaco) {
   if (registered) return
   registered = true
-  monaco.languages.register({ id: 'coco', extensions: ['.coco'], aliases: ['Coco'] })
+  monaco.languages.register({ id: 'coco', extensions: ['.coco'], aliases: ['Coco', 'Coco (Python)'] })
 
   monaco.languages.setMonarchTokensProvider('coco', {
     defaultToken: '',
-    keywords: [...COCO_KEYWORDS, ...PY_KEYWORDS],
+    keywords: KEYWORDS,
     types: TYPES,
     builtins: BUILTINS,
+    globals: GLOBAL_NAMES,
     tokenizer: {
       root: [
-        [/\b(step|flow)(\s+)([A-Za-z_]\w*)/, ['keyword', 'white', 'entity.name.function']],
+        [/\b(def)(\s+)([A-Za-z_]\w*)/, ['keyword', 'white', 'entity.name.function']],
         [/\b(class)(\s+)([A-Za-z_]\w*)/, ['keyword', 'white', 'type.identifier']],
-        [/\b(package)(\s+)([A-Za-z_]\w*)/, ['keyword', 'white', 'namespace']],
+        [/^(\s*)(@)((?:coco\.)?(?:step|flow))\b/, ['white', 'annotation.coco', 'annotation.coco']],
+        [/^(\s*)(@[A-Za-z_][\w.]*)/, ['white', 'annotation']],
         [/#.*$/, 'comment'],
         [/\b(True|False|None)\b/, 'constant'],
-        [/\b(self|env)\b/, 'variable.predefined'],
-        [/@[A-Za-z_]\w*/, 'annotation'],
-        [/[A-Z]\w*/, 'type.identifier'],
-        [/[a-z_]\w*(?=\s*\()/, { cases: { '@keywords': 'keyword', '@types': 'type', '@builtins': 'predefined', '@default': 'function' } }],
-        [/[a-z_]\w*/, { cases: { '@keywords': 'keyword', '@types': 'type', '@builtins': 'predefined', '@default': 'identifier' } }],
-        [/\[\]/, 'type'],
+        [/\b(self|cls)\b/, 'variable.predefined'],
+        [/[A-Z]\w*/, { cases: { '@types': 'type', '@default': 'type.identifier' } }],
+        [/[a-z_]\w*(?=\s*\()/, { cases: { '@keywords': 'keyword', '@globals': 'predefined.coco', '@types': 'type', '@builtins': 'predefined', '@default': 'function' } }],
+        [/[a-z_]\w*/, { cases: { '@keywords': 'keyword', '@globals': 'predefined.coco', '@types': 'type', '@builtins': 'predefined', '@default': 'identifier' } }],
+        [/->/, 'operator'],
         [/[{}()[\]]/, '@brackets'],
-        [/\d+\.\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|0[xX][0-9a-fA-F]+|\d+/, 'number'],
+        [/\d[\d_]*\.[\d_]*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*j?/, 'number'],
         [/[fFrRbBuU]{0,2}"""/, 'string', '@tdq'],
-        [/[fFrRbBuU]{0,2}'''/, 'string', '@tsq'],
+        [/[fFrRbBuU]{0,2}\'\'\'/, 'string', '@tsq'],
         [/[fFrRbBuU]{0,2}"/, 'string', '@dq'],
         [/[fFrRbBuU]{0,2}'/, 'string', '@sq'],
-        [/[=<>!+\-*/%&|^~]+/, 'operator'],
+        [/[=<>!+\-*/%&|^~@]+/, 'operator'],
         [/[:.,;]/, 'delimiter'],
       ],
       dq: [[/[^\\"]+/, 'string'], [/\\./, 'string.escape'], [/"/, 'string', '@pop']],
       sq: [[/[^\\']+/, 'string'], [/\\./, 'string.escape'], [/'/, 'string', '@pop']],
       tdq: [[/[^\\"]+/, 'string'], [/\\./, 'string.escape'], [/"""/, 'string', '@pop'], [/"/, 'string']],
-      tsq: [[/[^\\']+/, 'string'], [/\\./, 'string.escape'], [/'''/, 'string', '@pop'], [/'/, 'string']],
+      tsq: [[/[^\\']+/, 'string'], [/\\./, 'string.escape'], [/\'\'\'/, 'string', '@pop'], [/'/, 'string']],
     },
   } as Monaco.languages.IMonarchLanguage)
 
@@ -145,15 +152,23 @@ export function registerCoco(monaco: typeof Monaco) {
       const before = model.getLineContent(position.lineNumber).slice(0, word.startColumn - 1)
       const sym = symbolsByModel.get(model.uri.toString())
 
-      if (/\bself\.$/.test(before)) {
+      if (/(?:^|[^\w.])context\.$/.test(before)) {
         return {
-          suggestions: SELF_MEMBERS.map(m => ({
-            label: m.label, kind: m.insert.includes('(') ? K.Method : K.Property, insertText: m.insert,
-            insertTextRules: Snippet, documentation: { value: m.doc }, range,
+          suggestions: CONTEXT_MEMBERS.map(m => ({
+            label: m.label, kind: K.Property, insertText: m.label, documentation: { value: m.doc }, range,
           })),
         }
       }
-      const envPath = before.match(/(?:^|[^\w.])(?:self\.)?env((?:\.[A-Za-z_]\w*)*)\.$/)
+      const coco = before.match(/(?:^|[^\w.])coco\.$/)
+      if (coco) {
+        return {
+          suggestions: [
+            ...['step', 'flow', 'Model'].map(l => ({ label: l, kind: K.Function, insertText: l, range })),
+            ...GLOBALS.map(g => ({ label: g.label, kind: K.Function, insertText: g.insert, insertTextRules: Snippet, documentation: { value: g.doc }, range })),
+          ],
+        }
+      }
+      const envPath = before.match(/(?:^|[^\w.])env((?:\.[A-Za-z_]\w*)*)\.$/)
       if (envPath) {
         let node: unknown = envData ?? {}
         for (const key of envPath[1].split('.').filter(Boolean)) {
@@ -172,6 +187,8 @@ export function registerCoco(monaco: typeof Monaco) {
         }
       }
       const alias = before.match(/\b([A-Za-z_]\w*)\.$/)
+      const other = alias ? sym?.imports.find(i => i.kind === 'coco' && (i.alias ?? i.module) === alias[1]) : undefined
+      if (other) return { suggestions: [] }  // members of another workflow: not known here
       if (alias) {
         // fields of a declared class are unknown here (no types per variable), so offer class fields by name
         const fields = new Map<string, string>()
@@ -183,25 +200,30 @@ export function registerCoco(monaco: typeof Monaco) {
 
       const suggestions: Monaco.languages.CompletionItem[] = []
       const snippets: [string, string, string][] = [
-        ['step', 'step ${1:name}(${2:string input})(${3:string output}):\n\t${4:return input}', 'New step'],
-        ['flow', 'flow ${1:main}(${2:string input})(${3:string output}):\n\t${4:pass}', 'New flow'],
-        ['class', 'class ${1:Name}:\n\t${2:string field}', 'New class'],
+        ['@step', '@step\ndef ${1:name}(${2:value}: ${3:str}) -> ${4:str}:\n\t${5:return value}', 'New step: plain Python; type hints describe inputs, `->` the output'],
+        ['@flow', '@flow\ndef ${1:main}(${2:name}: ${3:str}) -> ${4:str}:\n\t${5:pass}', 'New flow: calls steps and flows; if/for/return only'],
+        ['stepn', '@step\ndef ${1:name}(${2:value}: ${3:str}) -> {"${4:a}": ${5:int}, "${6:b}": ${7:str}}:\n\treturn {"$4": ${8:0}, "$6": ${9:""}}', 'Step with named outputs'],
+        ['class', 'class ${1:Name}:\n\t${2:field}: ${3:str}', 'New data class (validated, like a pydantic model)'],
+        ['imp', 'from coco import step, flow, log, env', 'Import the coco API'],
         ['if', 'if ${1:condition}:\n\t$0', 'if block'],
-        ['for', 'for ${1:i} in range(${2:0}, ${3:n}, ${4:1}):\n\t$0', 'for over a range'],
-        ['foreach', 'for ${1:item} in ${2:items}:\n\t$0', 'for over an array'],
+        ['for', 'for ${1:i} in range(${2:n}):\n\t$0', 'for over a range'],
+        ['foreach', 'for ${1:item} in ${2:items}:\n\t$0', 'for over a list'],
       ]
       for (const [label, insertText, doc] of snippets) {
         suggestions.push({ label, kind: K.Snippet, insertText, insertTextRules: Snippet, documentation: doc, range })
       }
-      for (const k of COCO_KEYWORDS) suggestions.push({ label: k, kind: K.Keyword, insertText: k, range })
-      suggestions.push({ label: 'env', kind: K.Variable, insertText: 'env', range, detail: `run environment${envName ? ` (${envName})` : ''}`,
-        documentation: 'Read-only run environment: `env.key`, `env["key"]`, `env.get("key", default)`.' })
+      for (const k of KEYWORDS) suggestions.push({ label: k, kind: K.Keyword, insertText: k, range })
+      for (const g of GLOBALS) {
+        suggestions.push({ label: g.label, kind: g.insert.includes('(') ? K.Function : K.Variable, insertText: g.insert,
+          insertTextRules: Snippet, documentation: { value: g.doc }, range,
+          detail: g.label === 'env' ? `run environment${envName ? ` (${envName})` : ''}` : 'coco' })
+      }
       for (const t of TYPES) suggestions.push({ label: t, kind: K.TypeParameter, insertText: t, range, detail: 'type' })
       for (const b of BUILTINS) suggestions.push({ label: b, kind: K.Function, insertText: b, range, detail: 'builtin' })
       for (const c of sym?.classes ?? []) {
         suggestions.push({
           label: c.name, kind: K.Class, insertText: c.name, range,
-          detail: `class ${c.name}`, documentation: c.fields.map(f => `${f.type} ${f.name}`).join('\n'),
+          detail: `class ${c.name}`, documentation: c.fields.map(f => `${f.name}: ${f.type}`).join('\n'),
         })
       }
       for (const s of sym?.steps ?? []) {
@@ -266,13 +288,20 @@ export function registerCoco(monaco: typeof Monaco) {
       let text: string | null = null
       if (step) text = sigText('step', step)
       else if (flow) text = sigText('flow', flow)
-      else if (cls) text = `class ${cls.name}:\n${cls.fields.map(f => `    ${f.type} ${f.name}`).join('\n')}`
+      else if (cls) text = `class ${cls.name}:\n${cls.fields.map(f => `    ${f.name}: ${f.type}`).join('\n')}`
       else if (w.word === 'env') text = `env: run environment${envName ? ` (${envName})` : ''}\n${Object.keys(envData ?? {}).map(k => `env.${k}`).join('\n')}`
-      else if (w.word === 'self') text = `self: StepContext\n${SELF_MEMBERS.map(m => `self.${m.label}`).join('\n')}`
-      if (!text) return null
+      else if (w.word === 'context') text = `context\n${CONTEXT_MEMBERS.map(m => `context.${m.label}`).join('\n')}`
+      if (!text) {
+        const g = GLOBALS.find(x => x.label === w.word && x.insert.includes('('))
+        if (!g) return null
+        return {
+          range: new monaco.Range(position.lineNumber, w.startColumn, position.lineNumber, w.endColumn),
+          contents: [{ value: '```python\n' + g.label + '(...)\n```' }, { value: g.doc }],
+        }
+      }
       return {
         range: new monaco.Range(position.lineNumber, w.startColumn, position.lineNumber, w.endColumn),
-        contents: [{ value: '```coco\n' + text + '\n```' }],
+        contents: [{ value: '```python\n' + text + '\n```' }],
       }
     },
   })
@@ -288,6 +317,8 @@ export function registerCoco(monaco: typeof Monaco) {
     { token: 'namespace', foreground: dark ? '4EC9B0' : '267F99' },
     { token: 'constant', foreground: dark ? '569CD6' : '0000FF' },
     { token: 'annotation', foreground: dark ? 'DCDCAA' : '795E26' },
+    { token: 'annotation.coco', foreground: dark ? 'F5A97F' : 'C2410C', fontStyle: 'bold' },
+    { token: 'predefined.coco', foreground: dark ? 'F5A97F' : 'C2410C' },
   ]
   monaco.editor.defineTheme('coco-light', { base: 'vs', inherit: true, rules: rules(false), colors: {} })
   monaco.editor.defineTheme('coco-dark', { base: 'vs-dark', inherit: true, rules: rules(true), colors: { 'editor.background': '#18181b' } })

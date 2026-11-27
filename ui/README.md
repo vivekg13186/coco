@@ -54,8 +54,9 @@ npx vue-tsc --noEmit   # type check
 
 ## Differences from the design
 
-- Python inside steps is highlighted by the same tokenizer as Coco (one combined rule set) instead of an
-  embedded Python grammar; it covers keywords, builtins, strings, f-strings, numbers, comments and `self`.
+- Workflow files are plain Python, so the `coco` language in Monaco is a Python tokenizer that also marks
+  `@step` / `@flow` and the coco globals (`log`, `env`, `context`, ...); completion and hover come from the
+  engine's symbols.
 - State lives in small reactive stores (`useTabs`, `useSignals`) instead of Pinia, and API types are written
   by hand in `types/api.ts`: the API returns plain JSON objects, so a generated OpenAPI client would have no
   response types.

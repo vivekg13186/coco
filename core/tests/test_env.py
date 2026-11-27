@@ -12,7 +12,7 @@ DEV = json.loads((EXAMPLES / "dev.env.json").read_text())
 
 
 def compile_src(src: str) -> coco.Program:
-    return coco.compile(textwrap.dedent(src), "test.coco")
+    return coco.compile("from coco import step, flow, env\n" + textwrap.dedent(src), "test.coco")
 
 
 def test_env_in_flows_and_steps():
@@ -42,48 +42,45 @@ def test_env_defaults_and_missing_keys():
 
 def test_missing_key_in_flow_is_an_expression_error():
     prog = compile_src("""
-    package p
-    flow f()(string s):
+    @flow
+    def f() -> str:
         return env.region.name
     """)
     res = prog.run("f", {}, env={"region": {}})
     assert res.error["code"] == "expression_error" and "env.region has no key `name`" in res.error["message"]
 
 
-def test_env_is_read_only_and_reserved():
+def test_env_is_read_only_and_reserved_in_flows():
     prog = compile_src("""
-    package p
-    step s()(string out):
-        self.env.x = 1
+    @step
+    def s() -> str:
+        env.x = 1
         return "never"
-    flow f()(string o):
-        string r
+    @flow
+    def f() -> str:
         r = s()
         return r
     """)
     res = prog.run("f", {}, env={"x": 0})
     assert res.status == "failed" and "read-only" in res.error["message"]
-
     errs = [d.code for d in coco.check(textwrap.dedent("""
-    package p
-    step s(int env)():
-        pass
-    flow f()():
-        int env
+    from coco import flow
+    @flow
+    def f():
+        env = 1
     """)) if d.severity == "error"]
-    assert errs == ["E201", "E201"]
+    assert errs == ["E201"]
 
 
 def test_env_values_pass_into_steps_and_items():
     prog = compile_src("""
-    package p
-    step keys(object o, string k)(int n, string v):
-        return len(o), k
-    flow f()(int n, string v):
-        int a
-        string b
-        (a, b) = keys(env.db, env["db"]["host"])
-        return a, b
+    @step
+    def keys(o: dict, k: str) -> {"n": int, "v": str}:
+        return {"n": len(o), "v": k}
+    @flow
+    def f() -> {"n": int, "v": str}:
+        a, b = keys(env.db, env["db"]["host"])
+        return {"n": a, "v": b}
     """)
     res = prog.run("f", {}, env={"db": {"host": "localhost", "port": 5432}})
     assert res.ok, res.error
@@ -91,7 +88,7 @@ def test_env_values_pass_into_steps_and_items():
 
 
 def test_env_must_be_an_object():
-    prog = compile_src("package p\nflow f()():\n    pass\n")
+    prog = compile_src("@flow\ndef f():\n    pass\n")
     with pytest.raises(TypeError):
         prog.run("f", {}, env=[1, 2])  # type: ignore[arg-type]
 

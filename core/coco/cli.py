@@ -1,4 +1,4 @@
-"""Command line: `coco check file.coco` and `coco run file.coco flow --input in.json`."""
+"""Command line: `coco check file.coco` and `coco run file.coco flow --input in.json` (the workflow is named after the file)."""
 from __future__ import annotations
 
 import argparse
@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("-s", "--set", action="append", metavar="NAME=VALUE",
                    help="set one input; VALUE is parsed as JSON when possible")
     r.add_argument("-e", "--events", choices=["text", "json", "none"], default="text")
-    r.add_argument("--env", metavar="FILE", help="JSON file with the run environment (`env` in flows, `self.env` in steps)")
+    r.add_argument("--env", metavar="FILE", help="JSON file with the run environment (`env` in flows and steps)")
     r.set_defaults(func=cmd_run)
 
     args = ap.parse_args(argv)

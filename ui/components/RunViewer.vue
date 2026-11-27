@@ -300,8 +300,8 @@ const kindLabel: Record<string, string> = { flow: 'flow', subflow: 'sub-flow', s
             <div class="console-list">
               <LogEntry v-for="ev in shownLogs" :key="ev.seq" :event="ev" @locate="locate" />
               <div v-if="!logs.length" class="muted pad">
-                No logs yet. In a step: <code>self.log("total", n, data)</code>, <code>self.warn(...)</code>,
-                <code>self.error(...)</code> or <code>self.log_table(rows)</code>. <code>print()</code> output lands here too.
+                No logs yet. In a step or flow: <code>log("total", n, data)</code>, <code>warn(...)</code>,
+                <code>error(...)</code> or <code>log_table(rows)</code>. <code>print()</code> output lands here too.
               </div>
             </div>
           </div>

@@ -28,14 +28,15 @@ PREFIX = "/api/v1"
 
 # ---------------------------------------------------------------- request bodies
 class WorkflowCreate(BaseModel):
+    name: str
     source: str
     description: str = ""
-    name: str | None = None
 
 
 class WorkflowUpdate(BaseModel):
     source: str | None = None
     description: str | None = None
+    name: str | None = None  # rename
 
 
 class ValidateIn(BaseModel):
@@ -177,7 +178,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
 
     @api.put("/workflows/{wf}")
     def update_workflow(wf: str, body: WorkflowUpdate):
-        out = store.save_workflow(db, wf, body.source, body.description)
+        out = store.save_workflow(db, wf, body.source, body.description, body.name)
         runs.invalidate()
         return out
 

@@ -60,7 +60,7 @@ async function duplicate(w: Workflow) {
     let name = `${w.name}_copy`
     let n = 2
     while (rows.value.some(r => r.name === name)) name = `${w.name}_copy${n++}`
-    const copy = await api.createWorkflow(src.replace(/^package\s+\w+/m, `package ${name}`), w.description)
+    const copy = await api.createWorkflow(name, src, w.description)
     bump('workflows')
     open('wf', copy.id, copy.name)
   } catch (e: any) {
@@ -95,7 +95,12 @@ async function onImport(ev: Event) {
   if (!file) return
   try {
     const source = await file.text()
-    const w = await api.createWorkflow(source)
+    let name = file.name.replace(/\.(coco|py|txt)$/i, '').replace(/\W/g, '_') || 'workflow'
+    if (/^\d/.test(name)) name = `w_${name}`
+    const base = name
+    let n = 2
+    while (rows.value.some(r => r.name === name)) name = `${base}_${n++}`
+    const w = await api.createWorkflow(name, source)
     toast.add({ severity: 'success', summary: `Imported ${w.name}`, detail: w.current_version?.is_valid ? undefined : 'It has errors to fix.', life: 3000 })
     bump('workflows')
     open('wf', w.id, w.name)
@@ -111,8 +116,8 @@ async function onImport(ev: Event) {
       <template #start>
         <div class="row">
           <Button label="New" icon="pi pi-plus" size="small" @click="openNewWorkflow()" />
-          <Button label="Import .coco" icon="pi pi-upload" size="small" severity="secondary" outlined @click="fileInput?.click()" />
-          <input ref="fileInput" type="file" accept=".coco,text/plain" hidden @change="onImport">
+          <Button label="Import file" icon="pi pi-upload" size="small" severity="secondary" outlined @click="fileInput?.click()" />
+          <input ref="fileInput" type="file" accept=".coco,.py,text/plain,text/x-python" hidden @change="onImport">
           <Button v-tooltip.bottom="'Refresh'" icon="pi pi-refresh" size="small" text :loading="loading" @click="load" />
         </div>
       </template>

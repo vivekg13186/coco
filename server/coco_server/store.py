@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import keyword
 import re
 from typing import Any, Callable
 
@@ -33,18 +34,32 @@ def make_loader(db: Database, exclude: str | None = None) -> Callable[[str], str
 
 
 def analyze(db: Database, source: str, own_name: str | None = None) -> dict[str, Any]:
-    sym = coco.symbols(source)
-    name = own_name or sym["package"] or "workflow"
-    loader = make_loader(db, exclude=sym["package"])
-    diags = coco.check(source, f"{name}.coco", loader)
-    sym = coco.symbols(source, f"{name}.coco", loader)
+    """Diagnostics and symbols for a workflow source. The workflow's name comes from the engine, not the
+    source; `import other` resolves to the workflow named `other`."""
+    name = own_name or "workflow"
+    loader = make_loader(db, exclude=name)
+    diags = coco.check(source, f"{name}.coco", loader, name=name)
+    sym = coco.symbols(source, f"{name}.coco", loader, name=name)
     return {
-        "package": sym["package"],
         "is_valid": not any(d.severity == "error" for d in diags),
         "diagnostics": [d.to_dict() for d in diags],
         "flows": sym["flows"],
         "symbols": sym,
     }
+
+
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def check_name(name: str | None) -> str:
+    """Workflow names are Python identifiers, because other workflows `import` them by name."""
+    name = (name or "").strip()
+    if not name:
+        raise ApiError(422, "missing_name", "a workflow needs a name")
+    if not NAME_RE.match(name) or keyword.iskeyword(name) or name == "coco":
+        raise ApiError(422, "invalid_name", f"`{name}` is not a valid workflow name: use letters, digits and _ "
+                                            "(not starting with a digit), like a Python module name")
+    return name
 
 
 # ---------------------------------------------------------------- workflows
@@ -103,42 +118,34 @@ def _insert_version(c, wf_id: str, number: int, source: str, info: dict[str, Any
     return vid
 
 
-def _require_package(info: dict[str, Any]) -> str:
-    if not info["package"]:
-        raise ApiError(422, "missing_package", "the source must start with `package <name>`; "
-                                               "the package name is the workflow name",
-                       details=info["diagnostics"])
-    return info["package"]
-
-
 def create_workflow(db: Database, source: str, description: str = "", name: str | None = None) -> dict[str, Any]:
-    info = analyze(db, source)
-    pkg = _require_package(info)
-    if name and name != pkg:
-        raise ApiError(422, "name_mismatch", f"workflow name `{name}` must match `package {pkg}`")
-    if db.one("SELECT id FROM workflow WHERE name = ?", (pkg,)):
-        raise ApiError(409, "duplicate_name", f"a workflow named `{pkg}` already exists")
+    name = check_name(name)
+    if db.one("SELECT id FROM workflow WHERE name = ?", (name,)):
+        raise ApiError(409, "duplicate_name", f"a workflow named `{name}` already exists")
+    info = analyze(db, source, own_name=name)
     wf_id, ts = new_id("wf"), now_iso()
     with db.tx() as c:
         c.execute("INSERT INTO workflow (id, name, description, created_at, updated_at) VALUES (?,?,?,?,?)",
-                  (wf_id, pkg, description or "", ts, ts))
+                  (wf_id, name, description or "", ts, ts))
         vid = _insert_version(c, wf_id, 1, source, info)
         c.execute("UPDATE workflow SET current_version_id = ? WHERE id = ?", (vid, wf_id))
     return get_workflow(db, wf_id)
 
 
-def save_workflow(db: Database, wf_id: str, source: str | None, description: str | None) -> dict[str, Any]:
+def save_workflow(db: Database, wf_id: str, source: str | None, description: str | None,
+                  name: str | None = None) -> dict[str, Any]:
     w = get_workflow_row(db, wf_id)
     cur = db.one("SELECT * FROM workflow_version WHERE id = ?", (w["current_version_id"],))
     with db.tx() as c:
+        new_name = w["name"]
+        if name is not None and name != w["name"]:
+            new_name = check_name(name)
+            other = c.execute("SELECT id FROM workflow WHERE name = ? AND id != ?", (new_name, w["id"])).fetchone()
+            if other:
+                raise ApiError(409, "duplicate_name", f"a workflow named `{new_name}` already exists")
+            c.execute("UPDATE workflow SET name = ?, updated_at = ? WHERE id = ?", (new_name, now_iso(), w["id"]))
         if source is not None and (cur is None or checksum(source) != cur["checksum"]):
-            info = analyze(db, source, own_name=w["name"])
-            pkg = _require_package(info)
-            if pkg != w["name"]:
-                other = c.execute("SELECT id FROM workflow WHERE name = ? AND id != ?", (pkg, w["id"])).fetchone()
-                if other:
-                    raise ApiError(409, "duplicate_name", f"a workflow named `{pkg}` already exists")
-                c.execute("UPDATE workflow SET name = ? WHERE id = ?", (pkg, w["id"]))
+            info = analyze(db, source, own_name=new_name)
             number = (c.execute("SELECT MAX(version) FROM workflow_version WHERE workflow_id = ?",
                                 (w["id"],)).fetchone()[0] or 0) + 1
             vid = _insert_version(c, w["id"], number, source, info)

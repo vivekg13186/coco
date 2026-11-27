@@ -63,9 +63,9 @@ export const api = {
   listWorkflows: (q?: string, page = 1, size = 500) =>
     request<Page<Workflow>>('GET', '/workflows', undefined, { q, page, size }),
   getWorkflow: (id: string) => request<Workflow>('GET', `/workflows/${encodeURIComponent(id)}`),
-  createWorkflow: (source: string, description = '') =>
-    request<Workflow>('POST', '/workflows', { source, description }),
-  saveWorkflow: (id: string, body: { source?: string; description?: string }) =>
+  createWorkflow: (name: string, source: string, description = '') =>
+    request<Workflow>('POST', '/workflows', { name, source, description }),
+  saveWorkflow: (id: string, body: { source?: string; description?: string; name?: string }) =>
     request<Workflow>('PUT', `/workflows/${encodeURIComponent(id)}`, body),
   deleteWorkflow: (id: string) => request<void>('DELETE', `/workflows/${encodeURIComponent(id)}`),
   versions: (id: string) => request<{ items: Version[] }>('GET', `/workflows/${encodeURIComponent(id)}/versions`),

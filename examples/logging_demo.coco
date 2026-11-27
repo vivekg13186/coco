@@ -1,35 +1,41 @@
-# Console-style logging: self.log / info / warn / error / debug take any values; log_table shows rows.
-package logging_demo
+"""Console-style logging: log / info / warn / error / debug take any values; log_table shows rows."""
+from coco import step, flow, log, info, warn, error, debug, log_table
+
 
 class Order:
-    string id
-    string customer
-    float total
-    boolean paid
+    id: str
+    customer: str
+    total: float
+    paid: bool
 
-step load_orders(int n)(Order orders[]):
+
+@step
+def load_orders(n: int) -> list[Order]:
     customers = ["ada", "bob", "cy"]
     orders = [Order(id=f"A{100 + i}", customer=customers[i % 3], total=round((19.5 * (i + 1)) % 97, 2),
                     paid=i % 4 != 0) for i in range(n)]
-    self.log("loaded", len(orders), "orders; first:", orders[0])
-    self.log_table(orders)
+    log("loaded", len(orders), "orders; first:", orders[0])
+    log_table(orders)
     return orders
 
-step check(Order orders[])(int unpaid):
+
+@step
+def check(orders: list[Order]) -> int:
     late = [o.id for o in orders if not o.paid]
     if late:
-        self.warn(len(late), "unpaid orders:", late)
+        warn(len(late), "unpaid orders:", late)
     totals = {c: round(sum(o.total for o in orders if o.customer == c), 2) for c in ("ada", "bob", "cy")}
-    self.debug("totals by customer", totals)
-    self.log_table(totals)
-    self.info("summary", {"count": len(orders), "unpaid": len(late), "flags": {"ok": not late, "ids": late[:3]}})
+    debug("totals by customer", totals)
+    log_table(totals)
+    info("summary", {"count": len(orders), "unpaid": len(late), "flags": {"ok": not late, "ids": late[:3]}})
     if len(late) > len(orders) // 2:
-        self.error("more than half of the orders are unpaid")
+        error("more than half of the orders are unpaid")
     return len(late)
 
-flow main(int n)(int unpaid):
-    Order orders[]
-    int u
+
+@flow
+def main(n: int = 8) -> {"unpaid": int}:
     orders = load_orders(n)
-    u = check(orders)
-    return u
+    unpaid = check(orders)
+    log("done:", unpaid, "unpaid")
+    return {"unpaid": unpaid}

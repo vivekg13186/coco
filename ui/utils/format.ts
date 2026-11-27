@@ -44,7 +44,25 @@ export function ago(iso: string | null | undefined, now = Date.now()): string {
   return `${Math.round(s / 86400)} d ago`
 }
 
-export function signature(sig: { inputs: { name: string; type: string }[]; outputs: { name: string; type: string }[] }): string {
-  const p = (xs: { name: string; type: string }[]) => xs.map(x => `${x.type} ${x.name}`).join(', ')
-  return `(${p(sig.inputs)}) → (${p(sig.outputs)})`
+type SigParam = { name: string; type: string; optional?: boolean; default?: unknown }
+
+/** Python-style signature: `(name: str, n: int = 2) -> {"message": str}`. */
+export function signature(sig: { inputs: SigParam[]; outputs: SigParam[] | null }): string {
+  const ins = sig.inputs.map(x => `${x.name}: ${x.type}${x.optional ? ` = ${pyValue(x.default)}` : ''}`).join(', ')
+  const outs = sig.outputs
+  let ret = ''
+  if (outs === null) ret = ''
+  else if (outs.length === 0) ret = ' -> None'
+  else if (outs.length === 1 && outs[0]!.name === 'result') ret = ` -> ${outs[0]!.type}`
+  else if (outs.every((o, i) => o.name === `result${i + 1}`)) ret = ` -> tuple[${outs.map(o => o.type).join(', ')}]`
+  else ret = ` -> {${outs.map(o => `"${o.name}": ${o.type}`).join(', ')}}`
+  return `(${ins})${ret}`
+}
+
+export function pyValue(v: unknown): string {
+  if (v === null || v === undefined) return 'None'
+  if (v === true) return 'True'
+  if (v === false) return 'False'
+  if (typeof v === 'string') return JSON.stringify(v)
+  return JSON.stringify(v).replace(/\btrue\b/g, 'True').replace(/\bfalse\b/g, 'False').replace(/\bnull\b/g, 'None')
 }

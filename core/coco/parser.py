@@ -1,260 +1,252 @@
-"""Parser for .coco files.
+"""Reads a workflow file. The file is plain Python, so Python's own parser does the work; this module
+picks out imports, classes, @step / @flow functions, helpers and constants, and reads type hints leniently.
 
-Coco is line- and indentation-based, so the top level is parsed line by line:
-`package`, `import`, `from`, `class`, `step`, `flow`. Step bodies are captured
-verbatim as Python. Flow bodies are Python-shaped, so after rewriting Coco
-declarations (`int d, f`) into marker calls they are parsed with Python's own
-`ast` module, which gives exact line and column numbers for free.
+Allowed at the top level: docstrings, imports, classes, functions (@step, @flow or plain helpers) and
+constants (`NAME = value` without calls). Anything else would run when the workflow loads, so it is
+reported as an error.
 """
 from __future__ import annotations
 
 import ast
-import keyword
-import re
-from dataclasses import dataclass
 
 from .diagnostics import Diagnostic
-from .model import ClassDef, Field, FlowDef, Import, Package, Param, StepDef, TypeRef
+from .model import ANY, ClassDef, Field, FlowDef, Import, Module, Param, StepDef, TypeRef
 
-IDENT = r"[A-Za-z_]\w*"
-DOTTED = rf"{IDENT}(?:\.{IDENT})*"
-
-RE_PACKAGE = re.compile(rf"^package\s+({IDENT})$")
-RE_IMPORT = re.compile(rf"^import\s+({DOTTED})(?:\s+as\s+({IDENT}))?$")
-RE_FROM = re.compile(rf"^from\s+({DOTTED})\s+import\s+({IDENT}(?:\s*,\s*{IDENT})*)$")
-RE_CLASS = re.compile(rf"^class\s+({IDENT})\s*:$")
-RE_CALLABLE = re.compile(rf"^(step|flow)\s+({IDENT})\s*\((.*?)\)\s*(?:\((.*?)\))?\s*:$")
-RE_PARAM = re.compile(rf"^({DOTTED})\s+({IDENT})\s*(\[\])?$")
-RE_FIELD = re.compile(rf"^({DOTTED})\s+({IDENT})\s*(\[\])?\s*(?:=\s*(.+))?$")
-RE_DECL = re.compile(
-    rf"^(\s*)({DOTTED})\s+({IDENT}\s*(?:\[\])?(?:\s*,\s*{IDENT}\s*(?:\[\])?)*)\s*(?:=\s*(.+))?$"
-)
-
-DECL_MARKER = "__coco_decl__"
-_NOT_TYPES = set(keyword.kwlist) | set(getattr(keyword, "softkwlist", []))
+_SCALARS = {"str": "str", "int": "int", "float": "float", "bool": "bool"}
+_DICTS = {"dict", "Dict", "Mapping", "MutableMapping"}
+_LISTS = {"list", "List", "Sequence", "Iterable", "set", "Set", "frozenset", "FrozenSet", "tuple", "Tuple"}
+_ANYS = {"Any", "object"}
+COCO_API = {"step", "flow", "Model", "log", "info", "warn", "warning", "error", "debug", "log_table",
+            "env", "context"}
 
 
-@dataclass
-class _Line:
-    no: int
-    text: str      # leading tabs expanded to 4 spaces
-    indent: int
-    blank: bool    # empty or comment-only
+def _decorator_kind(dec: ast.expr) -> str | None:
+    """`@step`, `@step(...)`, `@coco.step` -> "step"; same for flow. Arguments are ignored."""
+    node = dec.func if isinstance(dec, ast.Call) else dec
+    if isinstance(node, ast.Name) and node.id in ("step", "flow"):
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr in ("step", "flow") and isinstance(node.value, ast.Name) \
+            and node.value.id == "coco":
+        return node.attr
+    return None
 
 
-def strip_comment(s: str) -> str:
-    """Remove a trailing # comment, respecting quoted strings."""
-    quote = None
-    i = 0
-    while i < len(s):
-        c = s[i]
-        if quote:
-            if c == "\\":
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-        elif c in "\"'":
-            quote = c
-        elif c == "#":
-            return s[:i].rstrip()
-        i += 1
-    return s.rstrip()
+def _base_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
 
 
-def _split_lines(source: str, diags: list[Diagnostic]) -> list[_Line]:
-    out: list[_Line] = []
-    first_tab = first_space = None
-    for no, raw in enumerate(source.splitlines(), 1):
-        lead = raw[: len(raw) - len(raw.lstrip(" \t"))]
-        stripped = raw.strip()
-        blank = stripped == "" or stripped.startswith("#")
-        if not blank and lead:
-            if "\t" in lead and first_tab is None:
-                first_tab = no
-            if " " in lead and first_space is None:
-                first_space = no
-        expanded = lead.replace("\t", "    ")
-        out.append(_Line(no, expanded + raw[len(lead):], len(expanded), blank))
-    if first_tab and first_space:
-        diags.append(Diagnostic(max(first_tab, first_space), 1,
-                                "tabs and spaces are both used for indentation in this file",
-                                "warning", "W001"))
+class _Hints:
+    """Turns type hints into TypeRefs. Unknown types become `Any`; nothing here is an error."""
+
+    def __init__(self, classes: set[str], aliases: set[str]):
+        self.classes = classes
+        self.aliases = aliases
+
+    def __call__(self, node: ast.expr | None) -> TypeRef:
+        if node is None:
+            return ANY
+        if isinstance(node, ast.Constant):
+            if node.value is None:
+                return TypeRef("none")
+            if isinstance(node.value, str):  # forward reference: "Person"
+                try:
+                    return self(ast.parse(node.value, mode="eval").body)
+                except SyntaxError:
+                    return ANY
+            return ANY
+        if isinstance(node, ast.Name):
+            n = node.id
+            if n in _SCALARS:
+                return TypeRef(_SCALARS[n])
+            if n in _DICTS:
+                return TypeRef("dict")
+            if n in _LISTS:
+                return TypeRef("any", array=True)
+            if n == "None":
+                return TypeRef("none")
+            if n in self.classes:
+                return TypeRef(n)
+            return ANY
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in self.aliases:
+                return TypeRef(f"{node.value.id}.{node.attr}")  # maybe a class of another workflow
+            return self(ast.Name(node.attr, ast.Load()))
+        if isinstance(node, ast.Subscript):
+            base = _base_name(node.value)
+            args = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if base in ("tuple", "Tuple"):
+                return TypeRef("any", array=True)
+            if base in _LISTS:
+                inner = self(args[0])
+                return TypeRef(inner.name, array=True) if not inner.array else TypeRef("any", array=True)
+            if base in _DICTS:
+                return TypeRef("dict")
+            if base == "Optional":
+                t = self(args[0])
+                return TypeRef(t.name, t.array, True)
+            if base == "Union":
+                return self._union(args)
+            if base == "Annotated":
+                return self(args[0])
+            return ANY
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return self._union([node.left, node.right])
+        return ANY
+
+    def _union(self, parts: list[ast.expr]) -> TypeRef:
+        flat: list[ast.expr] = []
+
+        def walk(p: ast.expr) -> None:
+            if isinstance(p, ast.BinOp) and isinstance(p.op, ast.BitOr):
+                walk(p.left)
+                walk(p.right)
+            else:
+                flat.append(p)
+
+        for p in parts:
+            walk(p)
+        types = [self(p) for p in flat]
+        nullable = any(t.name == "none" for t in types)
+        rest = [t for t in types if t.name != "none"]
+        if len(rest) == 1:
+            return TypeRef(rest[0].name, rest[0].array, nullable or rest[0].nullable)
+        return TypeRef("any", nullable=nullable)
+
+
+def _outputs(fn: ast.FunctionDef, hint: _Hints, diags: list[Diagnostic]) -> list[Param] | None:
+    """Outputs from the `->` hint: none = unknown; `-> None` = no outputs; `-> T` = one output named
+    `result`; `-> {"a": T, "b": U}` = named outputs; `-> tuple[T, U]` = `result1`, `result2`."""
+    r = fn.returns
+    if r is None:
+        return None
+    if (isinstance(r, ast.Constant) and r.value is None) or (isinstance(r, ast.Name) and r.id == "None"):
+        return []
+    if isinstance(r, ast.Dict):
+        out: list[Param] = []
+        for k, v in zip(r.keys, r.values):
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value.isidentifier()):
+                diags.append(Diagnostic(r.lineno, r.col_offset + 1, "named outputs need simple string keys, "
+                                        'e.g. -> {"total": int, "ok": bool}', code="E111"))
+                return None
+            out.append(Param(k.value, hint(v), r.lineno))
+        return out
+    if isinstance(r, ast.Subscript) and _base_name(r.value) in ("tuple", "Tuple"):
+        args = r.slice.elts if isinstance(r.slice, ast.Tuple) else [r.slice]
+        return [Param(f"result{i + 1}", hint(a), r.lineno) for i, a in enumerate(args)]
+    return [Param("result", hint(r), r.lineno)]
+
+
+def _params(fn: ast.FunctionDef, hint: _Hints, diags: list[Diagnostic], literal_defaults: bool) -> list[Param]:
+    a = fn.args
+    if a.vararg or a.kwarg:
+        diags.append(Diagnostic(fn.lineno, fn.col_offset + 1, f"`{fn.name}`: *args and **kwargs are not supported; "
+                                "list each input", code="E112"))
+    positional = a.posonlyargs + a.args
+    defaults: list[ast.expr | None] = [None] * (len(positional) - len(a.defaults)) + list(a.defaults)
+    pairs = list(zip(positional, defaults)) + list(zip(a.kwonlyargs, a.kw_defaults))
+    out: list[Param] = []
+    for arg, default in pairs:
+        p = Param(arg.arg, hint(arg.annotation), arg.lineno)
+        if default is not None:
+            p.has_default = True
+            if literal_defaults:
+                try:
+                    p.default = ast.literal_eval(default)
+                except ValueError:
+                    diags.append(Diagnostic(default.lineno, default.col_offset + 1,
+                                            f"default of `{arg.arg}` must be a literal value", code="E113"))
+        out.append(p)
     return out
 
 
-def _parse_type(text: str) -> TypeRef:
-    return TypeRef(text)
+def _is_constant_value(node: ast.expr) -> bool:
+    """Module constants may not call anything (that would run when the workflow loads)."""
+    return not any(isinstance(n, (ast.Call, ast.Lambda, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr))
+                   for n in ast.walk(node))
 
 
-def _parse_params(text: str | None, line: int, diags: list[Diagnostic]) -> list[Param]:
-    params: list[Param] = []
-    if not text or not text.strip():
-        return params
-    for part in text.split(","):
-        p = part.strip()
-        m = RE_PARAM.match(p)
-        if not m:
-            diags.append(Diagnostic(line, 1, f"bad parameter `{p}`; expected `type name` or `type name[]`",
-                                    code="E101"))
-            continue
-        params.append(Param(TypeRef(m.group(1), bool(m.group(3))), m.group(2), line))
-    return params
-
-
-def _body_text(body: list[_Line]) -> tuple[str, int, int] | None:
-    """Dedent a captured block. Returns (text, first_line, removed_indent)."""
-    while body and body[-1].blank:
-        body = body[:-1]
-    real = [ln for ln in body if not ln.blank]
-    if not real:
-        return None
-    ind = min(ln.indent for ln in real)
-    parts = []
-    for ln in body:
-        if ln.blank:
-            parts.append("")  # blank or comment-only: no code, keep the line so numbers stay aligned
-        else:
-            parts.append(ln.text[ind:])
-    return "\n".join(parts), body[0].no, ind
-
-
-def _rewrite_decls(text: str, first_line: int, col: int, diags: list[Diagnostic]) -> str:
-    """Turn `int d, f` / `Person ps[]` / `int n = 0` into marker calls Python can parse."""
-    out = []
-    for i, line in enumerate(text.split("\n")):
-        code = strip_comment(line)
-        m = RE_DECL.match(code)
-        if m and m.group(2).split(".")[0] not in _NOT_TYPES and m.group(3).split(",")[0].strip() not in _NOT_TYPES:
-            indent, type_name, names, init = m.groups()
-            name_list = [n.replace(" ", "") for n in names.split(",")]
-            args = ", ".join(repr(n) for n in name_list)
-            new = f"{indent}{DECL_MARKER}({type_name!r}, {args})"
-            if init is not None:
-                if len(name_list) != 1 or name_list[0].endswith("[]"):
-                    diags.append(Diagnostic(first_line + i, col + len(indent) + 1,
-                                            "an initial value is only allowed when declaring one variable",
-                                            code="E102"))
-                else:
-                    new += f"; {name_list[0]} = {init}"
-            out.append(new)
-        else:
-            out.append(line)
-    return "\n".join(out)
-
-
-def parse(source: str, filename: str = "<coco>") -> tuple[Package, list[Diagnostic]]:
+def parse(source: str, filename: str = "<coco>", name: str = "workflow") -> tuple[Module, list[Diagnostic]]:
     diags: list[Diagnostic] = []
-    lines = _split_lines(source, diags)
-    pkg = Package(name=None, line=0, filename=filename, source=source)
-    i, n = 0, len(lines)
-    while i < n:
-        ln = lines[i]
-        if ln.blank:
-            i += 1
+    mod = Module(name=name, filename=filename, source=source)
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError as e:
+        diags.append(Diagnostic(e.lineno or 1, e.offset or 1, f"syntax error: {e.msg}", code="E100"))
+        return mod, diags
+    mod.tree = tree
+
+    classes = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
+    aliases: set[str] = set()
+    for n in tree.body:
+        if isinstance(n, ast.Import):
+            aliases.update(a.asname or a.name.split(".")[0] for a in n.names)
+    hint = _Hints(classes, aliases)
+
+    for i, node in enumerate(tree.body):
+        line, col = node.lineno, node.col_offset + 1
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue  # docstring or a bare string
+        if isinstance(node, ast.Pass):
             continue
-        if ln.indent > 0:
-            diags.append(Diagnostic(ln.no, ln.indent + 1, "unexpected indentation", code="E100"))
-            i += 1
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "coco" or a.name.startswith("coco."):
+                    continue
+                mod.imports.append(Import(a.name, a.asname, [], False, line, node))
             continue
-        header = strip_comment(ln.text).strip()
-        j = i + 1
-        body: list[_Line] = []
-        while j < n and (lines[j].blank or lines[j].indent > 0):
-            body.append(lines[j])
-            j += 1
-        has_body = any(not b.blank for b in body)
-        word = header.split()[0] if header.split() else ""
-        no = ln.no
-
-        if word in ("package", "import", "from"):
-            if has_body:
-                first = next(b for b in body if not b.blank)
-                diags.append(Diagnostic(first.no, first.indent + 1, "unexpected indented block", code="E100"))
-            if word == "package":
-                m = RE_PACKAGE.match(header)
-                if not m:
-                    diags.append(Diagnostic(no, 1, "expected `package <name>`", code="E103"))
-                elif pkg.name is not None:
-                    diags.append(Diagnostic(no, 1, "package is declared twice", code="E104"))
-                else:
-                    pkg.name, pkg.line = m.group(1), no
-            elif word == "import":
-                m = RE_IMPORT.match(header)
-                if not m:
-                    diags.append(Diagnostic(no, 1, "expected `import module [as name]`", code="E103"))
-                else:
-                    pkg.imports.append(Import(m.group(1), m.group(2), [], False, no))
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                diags.append(Diagnostic(line, col, "relative imports are not supported", code="E115"))
+                continue
+            if node.module == "coco" or (node.module or "").startswith("coco."):
+                continue
+            mod.imports.append(Import(node.module or "", None, [a.asname or a.name for a in node.names], True, line,
+                                      node))
+            continue
+        if isinstance(node, ast.ClassDef):
+            fields = []
+            for b in node.body:
+                if isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name):
+                    fields.append(Field(b.target.id, hint(b.annotation), b.lineno, b.value is not None))
+            mod.classes.append(ClassDef(node.name, fields, line))
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kinds = [k for k in (_decorator_kind(d) for d in node.decorator_list) if k]
+            if len(kinds) > 1:
+                diags.append(Diagnostic(line, col, f"`{node.name}` cannot be both a step and a flow", code="E116"))
+                continue
+            if not kinds:
+                mod.helpers.append(node.name)
+                continue
+            if isinstance(node, ast.AsyncFunctionDef):
+                diags.append(Diagnostic(line, col, f"async {kinds[0]}s are not supported yet", code="E114"))
+                continue
+            if kinds[0] == "step":
+                mod.steps.append(StepDef(node.name, _params(node, hint, diags, False), _outputs(node, hint, diags),
+                                         line, node))
             else:
-                m = RE_FROM.match(header)
-                if not m:
-                    diags.append(Diagnostic(no, 1, "expected `from module import name, ...`", code="E103"))
-                else:
-                    names = [x.strip() for x in m.group(2).split(",")]
-                    pkg.imports.append(Import(m.group(1), None, names, True, no))
-
-        elif word == "class":
-            m = RE_CLASS.match(header)
-            if not m:
-                diags.append(Diagnostic(no, 1, "expected `class Name:`", code="E103"))
-            else:
-                fields: list[Field] = []
-                for b in body:
-                    if b.blank:
-                        continue
-                    text = strip_comment(b.text).strip()
-                    fm = RE_FIELD.match(text)
-                    if not fm:
-                        diags.append(Diagnostic(b.no, b.indent + 1,
-                                                f"bad field `{text}`; expected `type name [= default]`",
-                                                code="E105"))
-                        continue
-                    f = Field(TypeRef(fm.group(1), bool(fm.group(3))), fm.group(2), b.no)
-                    if fm.group(4) is not None:
-                        try:
-                            f.default = ast.literal_eval(fm.group(4))
-                            f.has_default = True
-                        except Exception:
-                            diags.append(Diagnostic(b.no, b.indent + 1,
-                                                    f"default for `{f.name}` must be a literal value",
-                                                    code="E106"))
-                    fields.append(f)
-                if not has_body:
-                    diags.append(Diagnostic(no, 1, f"class `{m.group(1)}` has no fields", "warning", "W002"))
-                pkg.classes.append(ClassDef(m.group(1), fields, no))
-
-        elif word in ("step", "flow"):
-            m = RE_CALLABLE.match(header)
-            if not m:
-                diags.append(Diagnostic(no, 1, f"expected `{word} name(inputs)(outputs):`", code="E103"))
-            else:
-                kind, name, ins, outs = m.groups()
-                params = _parse_params(ins, no, diags)
-                outputs = _parse_params(outs, no, diags)
-                bt = _body_text(body)
-                if bt is None:
-                    diags.append(Diagnostic(no, 1, f"{kind} `{name}` has an empty body", code="E107"))
-                    text, bline, bcol = "pass", no + 1, 4
-                else:
-                    text, bline, bcol = bt
-                if kind == "step":
-                    pkg.steps.append(StepDef(name, params, outputs, text, bline, bcol, no))
-                else:
-                    flow = FlowDef(name, params, outputs, text, bline, bcol, no)
-                    rewritten = _rewrite_decls(text, bline, bcol, diags)
-                    try:
-                        tree = ast.parse(rewritten, filename=filename)
-                        ast.increment_lineno(tree, bline - 1)
-                        flow.tree = tree
-                    except SyntaxError as e:
-                        diags.append(Diagnostic((e.lineno or 1) + bline - 1, (e.offset or 0) + bcol,
-                                                f"syntax error in flow `{name}`: {e.msg}", code="E108"))
-                    pkg.flows.append(flow)
-        else:
-            diags.append(Diagnostic(no, 1, f"unexpected `{word}`; expected package, import, class, step or flow",
-                                    code="E103"))
-        i = j
-
-    if pkg.name is None:
-        diags.append(Diagnostic(1, 1, "missing `package <name>` declaration", code="E109"))
-    return pkg, diags
+                extra = [d for d in node.decorator_list if not _decorator_kind(d)]
+                if extra:
+                    diags.append(Diagnostic(extra[0].lineno, extra[0].col_offset + 1,
+                                            "flows cannot have other decorators", code="E116"))
+                mod.flows.append(FlowDef(node.name, _params(node, hint, diags, True), _outputs(node, hint, diags),
+                                         line, node))
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            if all(isinstance(t, ast.Name) for t in targets) and (value is None or _is_constant_value(value)):
+                mod.constants.extend(t.id for t in targets)  # type: ignore[attr-defined]
+                continue
+            diags.append(Diagnostic(line, col, "module constants cannot call functions (that would run when the "
+                                    "workflow loads); compute the value inside a step", code="E110"))
+            continue
+        kind = type(node).__name__
+        diags.append(Diagnostic(line, col, f"`{kind}` is not allowed at the top level: it would run when the "
+                                "workflow loads. Allowed: imports, classes, functions, @step, @flow and constants",
+                                code="E110"))
+    return mod, diags

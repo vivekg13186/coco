@@ -1,48 +1,57 @@
-# Onboard a team: enrich each member, count changes, welcome changed members.
-package onboard
+"""Onboard a team: enrich each member, count changes, welcome changed members."""
+from coco import step, flow, log, warn, log_table
+
 
 class Person:
-    string name
-    int age = 0
+    name: str
+    age: int = 0
+
 
 class Team:
-    string title
-    Person members[]
+    title: str
+    members: list[Person]
 
-step enrich(Person p, string source)(Person out, boolean changed):
-    self.log("fetching", p.name)
+
+@step
+def enrich(p: Person, source: str) -> {"person": Person, "changed": bool}:
+    log("fetching", p.name)
     data = {"age": 30 + len(p.name), "source": source}  # stand-in for an API call
-    self.log("api response:", data)
+    log("api response:", data)
     changed = p.age != data["age"]
     if changed:
-        self.warn("age changed for", p.name, p.age, "->", data["age"])
+        warn("age changed for", p.name, p.age, "->", data["age"])
     p.age = data["age"]
-    return p, changed
+    return {"person": p, "changed": changed}
 
-step report(Team t)():
-    self.log_table(t.members, ["name", "age"])
 
-step send_mail(string to, string subject)():
+@step
+def report(t: Team) -> None:
+    log_table(t.members, ["name", "age"])
+
+
+@step
+def send_mail(to: str, subject: str) -> None:
     print(f"mail to {to}: {subject}")
 
-flow notify_member(Person p)():
+
+@flow
+def notify_member(p: Person) -> None:
     send_mail(p.name, "Welcome, " + p.name)
 
-flow onboard(Team t, int limit)(int processed, float avg_age):
-    int count, n, total
-    Person p
-    boolean changed
+
+@flow
+def onboard(t: Team, limit: int = 10) -> {"processed": int, "avg_age": float}:
     count = 0
     total = 0
     n = min(len(t.members), limit)
-    for i in range(0, n, 1):
-        (p, changed) = enrich(t.members[i], "https://api.example")
+    for member in t.members[:n]:
+        p, changed = enrich(member, "https://api.example")
         total = total + p.age
         if changed:
             count = count + 1
             notify_member(p)
     report(t)
     if n > 0:
-        return count, total / n
+        return {"processed": count, "avg_age": total / n}
     else:
-        return count, 0.0
+        return {"processed": count, "avg_age": 0.0}

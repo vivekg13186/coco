@@ -1,4 +1,9 @@
-"""Resolver + checker. Validates a parsed Package and builds the flow IR the runtime executes."""
+"""Checker for a parsed workflow Module. Validates flows (which stay restricted) and builds the flow IR
+the runtime interprets. Steps are plain Python and only get light checks.
+
+Types are lenient, like Python's own hints: unknown types are `Any`, and type mismatches in flows are
+warnings, not errors.
+"""
 from __future__ import annotations
 
 import ast
@@ -8,38 +13,46 @@ from types import CodeType
 from typing import TYPE_CHECKING, Any
 
 from .diagnostics import Diagnostic
-from .model import PRIMITIVES, ClassDef, FlowDef, Package, Param, StepDef, TypeRef
-from .parser import DECL_MARKER
+from .model import ANY, ClassDef, FlowDef, Module, Param, StepDef, TypeRef
+from .parser import COCO_API
 
 if TYPE_CHECKING:  # pragma: no cover
     from .program import Program
 
-T_INT, T_FLOAT, T_STR, T_BOOL = TypeRef("int"), TypeRef("float"), TypeRef("string"), TypeRef("boolean")
-T_OBJ, T_ARR = TypeRef("object"), TypeRef("array")
+T_INT, T_FLOAT, T_STR, T_BOOL = TypeRef("int"), TypeRef("float"), TypeRef("str"), TypeRef("bool")
+T_DICT, T_LIST, T_NONE = TypeRef("dict"), TypeRef("any", array=True), TypeRef("none")
 
-# builtins usable in flow expressions -> result type (None = unknown)
-BUILTINS: dict[str, TypeRef | None] = {
-    "len": T_INT, "min": None, "max": None, "abs": None, "round": None, "sum": None,
+# builtins usable in flow expressions -> result type
+BUILTINS: dict[str, TypeRef] = {
+    "len": T_INT, "min": ANY, "max": ANY, "abs": ANY, "round": ANY, "sum": ANY,
     "str": T_STR, "int": T_INT, "float": T_FLOAT, "bool": T_BOOL,
-    "sorted": T_ARR, "list": T_ARR,
+    "sorted": T_LIST, "list": T_LIST, "dict": T_DICT, "enumerate": T_LIST, "zip": T_LIST,
+    "any": T_BOOL, "all": T_BOOL, "range": T_LIST,
 }
-RESERVED = {"self", "env", DECL_MARKER}
+# coco functions a flow may call as a statement (they log under the flow)
+LOG_FUNCS = {"log", "info", "warn", "warning", "error", "debug", "log_table", "print"}
+# names a flow cannot assign to
+RESERVED = COCO_API | {"print"}
 # JSON spellings that are easy to paste into Python code by mistake
 JSON_WORDS = {"true": "True", "false": "False", "null": "None"}
 
 
 def json_word_message(word: str) -> str:
-    return f"`{word}` is JSON, not Python: use `{JSON_WORDS[word]}`"  # `env` is the run environment, read-only
+    return f"`{word}` is JSON, not Python: use `{JSON_WORDS[word]}`"
+
+
+def is_tuple_outputs(outs: list[Param] | None) -> bool:
+    return bool(outs) and len(outs) > 1 and all(p.name == f"result{i + 1}" for i, p in enumerate(outs))
 
 
 # ---------------------------------------------------------------- flow IR
 @dataclass
 class Callee:
-    kind: str                 # "step" | "flow"
+    kind: str                     # "step" | "flow"
     name: str
     params: list[Param]
-    outputs: list[Param]
-    package: str | None       # import alias for another Coco package, None = this package
+    outputs: list[Param] | None   # None: unknown (a step without `->`)
+    package: str | None           # import alias of another workflow, None = this one
 
     @property
     def label(self) -> str:
@@ -50,6 +63,7 @@ class Callee:
 class DeclIR:
     names: list[tuple[str, TypeRef]]
     line: int
+    value: CodeType | None = None  # `x: int = value`; None leaves x = None
 
 
 @dataclass
@@ -58,6 +72,21 @@ class CallIR:
     args: list[CodeType]
     kwargs: dict[str, CodeType]
     targets: list[str]
+    line: int
+
+
+@dataclass
+class LogIR:
+    func: str                     # log, info, warn, warning, error, debug, log_table, print
+    args: list[CodeType]
+    kwargs: dict[str, CodeType]
+    line: int
+
+
+@dataclass
+class ExprIR:
+    """A method call on a value, kept for its effect: `items.append(x)`."""
+    expr: CodeType
     line: int
 
 
@@ -79,7 +108,7 @@ class IfIR:
 @dataclass
 class ForIR:
     id: str
-    var: str
+    var: str | list[str]          # a name, or names to unpack each item into
     range_args: list[CodeType] | None
     iterable: CodeType | None
     body: list
@@ -87,8 +116,18 @@ class ForIR:
 
 
 @dataclass
+class BreakIR:
+    line: int
+
+
+@dataclass
+class ContinueIR:
+    line: int
+
+
+@dataclass
 class ReturnIR:
-    values: list[CodeType]
+    values: list[tuple[str, CodeType]]  # (output name, value), in declared order
     line: int
 
 
@@ -103,29 +142,36 @@ class FlowIR:
 
 # ---------------------------------------------------------------- checker
 class Checker:
-    def __init__(self, pkg: Package, coco_imports: dict[str, "Program"], diags: list[Diagnostic]):
-        self.pkg = pkg
+    def __init__(self, mod: Module, coco_imports: dict[str, "Program"], diags: list[Diagnostic]):
+        self.mod = mod
         self.imports = coco_imports
         self.diags = diags
         self.classes: dict[str, ClassDef] = {}
         self.steps: dict[str, StepDef] = {}
         self.flows: dict[str, FlowDef] = {}
+        self.helpers = set(mod.helpers)
+        self.constants = set(mod.constants)
         self.calls: dict[str, set[str]] = {}  # flow -> local flows it calls
-        self.filename = pkg.filename
+        self.filename = mod.filename
+        self.cur: FlowDef | None = None
+        self.loop_depth = 0
 
     # -- helpers
     def err(self, line: int, col: int, msg: str, code: str = "E200", severity: str = "error",
             end_col: int | None = None) -> None:
         self.diags.append(Diagnostic(line, col, msg, severity, code, end_col))
 
-    def type_known(self, t: TypeRef) -> bool:
-        if t.name in PRIMITIVES or t.name in self.classes:
-            return True
+    def warn(self, line: int, col: int, msg: str, code: str = "E214") -> None:
+        self.err(line, col, msg, code, "warning")
+
+    def norm(self, t: TypeRef) -> TypeRef:
+        """`alias.Class` stays only when it names a class of an imported workflow; otherwise Any."""
         if "." in t.name:
             alias, _, cname = t.name.rpartition(".")
             prog = self.imports.get(alias)
-            return bool(prog and cname in prog.classes)
-        return False
+            if not (prog and cname in prog.module.classes_by_name):
+                return TypeRef("any", t.array, t.nullable)
+        return t
 
     def class_def(self, t: TypeRef | None) -> ClassDef | None:
         if t is None or t.array:
@@ -135,104 +181,101 @@ class Checker:
         if "." in t.name:
             alias, _, cname = t.name.rpartition(".")
             prog = self.imports.get(alias)
-            if prog and cname in prog.package.classes_by_name:
-                return prog.package.classes_by_name[cname]
+            if prog and cname in prog.module.classes_by_name:
+                return prog.module.classes_by_name[cname]
         return None
 
-    def qualify(self, t: TypeRef, alias: str | None) -> TypeRef:
-        """A type named inside another package, seen from this one."""
-        if alias and t.name not in PRIMITIVES and "." not in t.name:
-            return TypeRef(f"{alias}.{t.name}", t.array)
+    @staticmethod
+    def qualify(t: TypeRef, alias: str | None, classes: dict[str, ClassDef]) -> TypeRef:
+        """A class named inside another workflow, seen from this one."""
+        if alias and t.name in classes:
+            return TypeRef(f"{alias}.{t.name}", t.array, t.nullable)
         return t
 
     @staticmethod
     def compatible(target: TypeRef | None, value: TypeRef | None) -> bool:
-        if target is None or value is None:
+        if target is None or value is None or target.is_any or value.is_any:
             return True
-        if target == value:
+        if value == T_NONE:
+            return target.nullable or target == T_NONE
+        if target.array or value.array:
+            if not (target.array and value.array):
+                return False
+            return target.name == "any" or value.name == "any" or Checker.compatible(target.element(),
+                                                                                     value.element())
+        tn, vn = target.name, value.name
+        if tn == vn:
             return True
-        if target.array:
-            return value.array and (value.name == target.name or target.name in ("object",)) or value == T_ARR
-        if target == T_ARR:
-            return value.array or value == T_ARR
-        if target == T_FLOAT and value == T_INT:
+        if tn == "float" and vn == "int":
             return True
-        if target == T_OBJ and not value.array and value.name not in PRIMITIVES:
-            return True
-        if value == T_OBJ and target.name not in PRIMITIVES and not target.array:
-            return True  # a dict can be validated into a class
+        if tn == "dict" or vn == "dict":
+            return tn not in ("str", "int", "float", "bool", "none") and vn not in ("str", "int", "float", "bool",
+                                                                                    "none")
         return False
-
-    def check_types(self, params: list[Param], where: str) -> None:
-        seen: set[str] = set()
-        for p in params:
-            if p.name in RESERVED:
-                self.err(p.line, 1, f"`{p.name}` is reserved and cannot be used as a name in {where}", "E201")
-            if p.name in seen:
-                self.err(p.line, 1, f"`{p.name}` is declared twice in {where}", "E202")
-            seen.add(p.name)
-            if not self.type_known(p.type):
-                self.err(p.line, 1, f"unknown type `{p.type.name}` in {where}", "E203")
 
     # -- top level
     def run(self) -> dict[str, FlowIR]:
         names: dict[str, int] = {}
-        for kind, items in (("class", self.pkg.classes), ("step", self.pkg.steps), ("flow", self.pkg.flows)):
+        for kind, items in (("classes", self.mod.classes), ("steps", self.mod.steps), ("flows", self.mod.flows)):
             for it in items:
                 if it.name in names:
                     self.err(it.line, 1, f"`{it.name}` is already defined on line {names[it.name]}", "E204")
                     continue
                 names[it.name] = it.line
-                getattr(self, kind + "es" if kind == "class" else kind + "s")[it.name] = it
-        for imp in self.pkg.imports:
-            alias = imp.alias or imp.module
-            if not imp.is_from and alias in names:
-                self.err(imp.line, 1, f"import name `{alias}` clashes with a definition on line {names[alias]}", "E204")
+                getattr(self, kind)[it.name] = it
+        for imp in self.mod.imports:
+            if not imp.is_from and imp.bound in names:
+                self.err(imp.line, 1, f"import name `{imp.bound}` clashes with a definition on line "
+                                      f"{names[imp.bound]}", "E204")
 
-        for c in self.pkg.classes:
-            seen: dict[str, int] = {}
+        for c in self.mod.classes:
             for f in c.fields:
-                if f.name in seen:
-                    self.err(f.line, 1, f"class `{c.name}`: field `{f.name}` is declared twice "
-                                        f"(first on line {seen[f.name]})", "E205")
-                seen.setdefault(f.name, f.line)
-                if not self.type_known(f.type):
-                    self.err(f.line, 1, f"class `{c.name}`: unknown type `{f.type.name}` for field `{f.name}`", "E203")
+                f.type = self.norm(f.type)
+        for s in self.mod.steps:
+            self._norm_sig(s)
+        for f in self.mod.flows:
+            self._norm_sig(f)
+            for p in f.params:
+                if p.name in RESERVED:
+                    self.err(p.line, 1, f"`{p.name}` is reserved and cannot be a flow input", "E201")
+            if f.outputs is None:
+                f.outputs = self.infer_outputs(f)
 
-        for s in self.pkg.steps:
-            self.check_types(s.params, f"step `{s.name}` inputs")
-            self.check_types(s.outputs, f"step `{s.name}` outputs")
-            self.check_step_body(s)
-
+        self.check_json_words()
         irs: dict[str, FlowIR] = {}
-        for f in self.pkg.flows:
-            self.check_types(f.params, f"flow `{f.name}` inputs")
-            self.check_types(f.outputs, f"flow `{f.name}` outputs")
-            if f.tree is not None:
-                irs[f.name] = self.check_flow(f)
+        for f in self.mod.flows:
+            irs[f.name] = self.check_flow(f)
         self.check_cycles()
         return irs
 
-    def check_step_body(self, s: StepDef) -> None:
-        args = ", ".join(["self"] + [p.name for p in s.params])
-        src = f"def {s.name}({args}):\n" + "\n".join("    " + ln if ln else "" for ln in s.body.split("\n"))
-        try:
-            tree = ast.parse(src, filename=self.filename)
-        except SyntaxError as e:
-            line = (e.lineno or 2) - 2 + s.body_line
-            col = max((e.offset or 1) - 4, 1) + s.body_col
-            self.err(line, col, f"Python syntax error in step `{s.name}`: {e.msg}", "E206")
-            return
-        self.check_json_words(s, tree)
+    def _norm_sig(self, d: StepDef | FlowDef) -> None:
+        for p in d.params:
+            p.type = self.norm(p.type)
+        for p in d.outputs or []:
+            p.type = self.norm(p.type)
 
-    def check_json_words(self, s: StepDef, tree: ast.Module) -> None:
-        """Flag `true` / `false` / `null` used as values in a step unless the code defines them itself."""
-        defined = {p.name for p in s.params} | {"self"}
-        for imp in self.pkg.imports:
-            if imp.is_from:
-                defined.update(imp.names)
-            else:
-                defined.add(imp.alias or imp.module.split(".")[0])
+    def infer_outputs(self, f: FlowDef) -> list[Param]:
+        """A flow without `->` gets its outputs from its first `return` with a value."""
+        for node in ast.walk(f.node):
+            if isinstance(node, ast.Return) and node.value is not None:
+                v = node.value
+                if isinstance(v, ast.Constant) and v.value is None:
+                    continue
+                if isinstance(v, ast.Dict) and v.keys and all(
+                        isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value.isidentifier()
+                        for k in v.keys):
+                    return [Param(k.value, ANY, node.lineno) for k in v.keys]  # type: ignore[union-attr]
+                if isinstance(v, ast.Tuple):
+                    return [Param(f"result{i + 1}", ANY, node.lineno) for i in range(len(v.elts))]
+                return [Param("result", ANY, node.lineno)]
+        return []
+
+    def check_json_words(self) -> None:
+        """Flag `true` / `false` / `null` used as values outside flows, unless the file defines them."""
+        tree = self.mod.tree
+        if tree is None:
+            return
+        defined = set(COCO_API)
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
                 defined.add(node.id)
@@ -243,12 +286,15 @@ class Checker:
                     defined.add(a.asname or a.name.split(".")[0])
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 defined.add(node.name)
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in JSON_WORDS
-                    and node.id not in defined):
-                line = node.lineno - 2 + s.body_line
-                col = node.col_offset - 4 + s.body_col + 1
-                self.err(line, col, json_word_message(node.id), "E235", end_col=col + len(node.id))
+        flow_nodes = {id(f.node) for f in self.mod.flows}
+        for top in tree.body:
+            if id(top) in flow_nodes:
+                continue  # flows report these themselves
+            for node in ast.walk(top):
+                if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in JSON_WORDS
+                        and node.id not in defined):
+                    col = node.col_offset + 1
+                    self.err(node.lineno, col, json_word_message(node.id), "E235", end_col=col + len(node.id))
 
     def check_cycles(self) -> None:
         state: dict[str, int] = {}
@@ -270,18 +316,20 @@ class Checker:
     # -- flows
     def check_flow(self, f: FlowDef) -> FlowIR:
         self.cur = f
-        self.scope: dict[str, TypeRef | None] = {p.name: p.type for p in f.params}
+        self.scope: dict[str, TypeRef] = {p.name: p.type for p in f.params}
         self.decls: dict[str, TypeRef] = {}
         self.counters = {"if": 0, "for": 0}
+        self.loop_depth = 0
         self.calls.setdefault(f.name, set())
-        body = self.block(f.tree.body)
-        if f.outputs and not self.terminates(f.tree.body):
-            self.err(f.line, 1, f"flow `{f.name}` declares outputs ({', '.join(p.name for p in f.outputs)}) "
+        body = self.block(f.node.body, top=True)
+        if f.outputs and not self.terminates(f.node.body):
+            self.err(f.line, 1, f"flow `{f.name}` has outputs ({', '.join(p.name for p in f.outputs)}) "
                                 f"but not every path ends in `return`", "E208")
-        return FlowIR(f.name, f.params, f.outputs, dict(self.decls), body)
+        return FlowIR(f.name, f.params, f.outputs or [], dict(self.decls), body)
 
-    def col(self, node: ast.AST) -> int:
-        return getattr(node, "col_offset", 0) + self.cur.body_col + 1
+    @staticmethod
+    def col(node: ast.AST) -> int:
+        return getattr(node, "col_offset", 0) + 1
 
     def compile_expr(self, node: ast.expr) -> CodeType:
         expr = ast.Expression(body=node)
@@ -298,38 +346,41 @@ class Checker:
             return bool(last.orelse) and self.terminates(last.body) and self.terminates(last.orelse)
         return False
 
-    def block(self, stmts: list[ast.stmt]) -> list:
+    def block(self, stmts: list[ast.stmt], top: bool = False) -> list:
         out = []
-        for st in stmts:
+        for i, st in enumerate(stmts):
+            if top and i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) \
+                    and isinstance(st.value.value, str):
+                continue  # docstring
             ir = self.stmt(st)
             if ir is not None:
                 out.append(ir)
         return out
 
     def resolve_callee(self, func: ast.expr) -> Callee | None:
-        if isinstance(func, ast.Name):
+        if isinstance(func, ast.Name) and func.id not in self.scope:
             if func.id in self.steps:
                 s = self.steps[func.id]
                 return Callee("step", s.name, s.params, s.outputs, None)
             if func.id in self.flows:
                 fl = self.flows[func.id]
                 return Callee("flow", fl.name, fl.params, fl.outputs, None)
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id not in self.scope:
             prog = self.imports.get(func.value.id)
             if prog:
                 alias = func.value.id
-                if func.attr in prog.package.steps_by_name:
-                    s = prog.package.steps_by_name[func.attr]
-                    return Callee("step", s.name, [self._q(p, alias) for p in s.params],
-                                  [self._q(p, alias) for p in s.outputs], alias)
-                if func.attr in prog.package.flows_by_name:
-                    fl = prog.package.flows_by_name[func.attr]
-                    return Callee("flow", fl.name, [self._q(p, alias) for p in fl.params],
-                                  [self._q(p, alias) for p in fl.outputs], alias)
+                m = prog.module
+                d: StepDef | FlowDef | None = m.steps_by_name.get(func.attr) or m.flows_by_name.get(func.attr)
+                if d is not None:
+                    kind = "step" if func.attr in m.steps_by_name else "flow"
+                    cls = m.classes_by_name
+                    params = [self._q(p, alias, cls) for p in d.params]
+                    outs = None if d.outputs is None else [self._q(p, alias, cls) for p in d.outputs]
+                    return Callee(kind, d.name, params, outs, alias)
         return None
 
-    def _q(self, p: Param, alias: str) -> Param:
-        return Param(self.qualify(p.type, alias), p.name, p.line)
+    def _q(self, p: Param, alias: str, classes: dict[str, ClassDef]) -> Param:
+        return Param(p.name, self.qualify(p.type, alias, classes), p.line, p.has_default, p.default)
 
     @staticmethod
     def _callee_name(func: ast.expr) -> str:
@@ -338,39 +389,75 @@ class Checker:
         except Exception:  # pragma: no cover
             return "?"
 
+    def _not_callable_msg(self, func: ast.expr) -> str:
+        name = self._callee_name(func)
+        if isinstance(func, ast.Name) and func.id in self.helpers:
+            return f"`{name}` is a plain function; add `@step` to call it from a flow"
+        if isinstance(func, ast.Name) and func.id in self.classes:
+            return f"class `{name}` can only be created inside a step"
+        return f"`{name}` is not a step or flow; flows can only call steps, flows and logging functions"
+
+    def declare(self, name: str, t: TypeRef, line: int, col: int) -> None:
+        if name in RESERVED:
+            self.err(line, col, f"`{name}` is reserved and cannot be assigned in a flow", "E201")
+            return
+        if name in self.scope:
+            if not self.compatible(self.scope[name], t):
+                self.warn(line, col, f"`{name}` is {self.scope[name]}, but is assigned {t}")
+            return
+        self.scope[name] = t
+        self.decls[name] = t
+
     def stmt(self, st: ast.stmt):
         line = st.lineno
-        # declaration marker
-        if (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Name)
-                and st.value.func.id == DECL_MARKER):
-            args = [a.value for a in st.value.args]
-            tname, names = args[0], args[1:]
-            out = []
-            for raw in names:
-                arr = raw.endswith("[]")
-                name = raw[:-2] if arr else raw
-                t = TypeRef(tname, arr)
-                if name in RESERVED:
-                    self.err(line, self.col(st), f"`{name}` is reserved and cannot be declared", "E201")
-                elif name in self.scope:
-                    self.err(line, self.col(st), f"`{name}` is already declared", "E202")
-                if not self.type_known(t):
-                    self.err(line, self.col(st), f"unknown type `{tname}`", "E203")
-                self.scope[name] = t
-                self.decls[name] = t
-                out.append((name, t))
-            return DeclIR(out, line)
-
         if isinstance(st, ast.Pass):
             return None
 
+        if isinstance(st, ast.Break) or isinstance(st, ast.Continue):
+            if self.loop_depth == 0:
+                self.err(line, self.col(st), f"`{'break' if isinstance(st, ast.Break) else 'continue'}` "
+                                             f"outside a loop", "E215")
+                return None
+            return BreakIR(line) if isinstance(st, ast.Break) else ContinueIR(line)
+
+        if isinstance(st, ast.AnnAssign):
+            if not isinstance(st.target, ast.Name):
+                self.err(line, self.col(st), "can only declare a variable", "E211")
+                return None
+            from .parser import _Hints
+            t = self.norm(_Hints(set(self.classes), set(self.imports))(st.annotation))
+            name = st.target.id
+            if name in RESERVED:
+                self.err(line, self.col(st), f"`{name}` is reserved and cannot be declared", "E201")
+                return None
+            if name in self.scope:
+                self.err(line, self.col(st), f"`{name}` is already declared", "E202")
+            self.scope[name] = t
+            self.decls[name] = t
+            if st.value is None:
+                return DeclIR([(name, t)], line)
+            if isinstance(st.value, ast.Call) and self.resolve_callee(st.value.func):
+                callee = self.resolve_callee(st.value.func)
+                return self.call(st.value, callee, [name], line)  # type: ignore[arg-type]
+            vt = self.expr(st.value)
+            if not self.compatible(t, vt):
+                self.warn(line, self.col(st), f"cannot assign {vt} to `{name}` of type {t}")
+            return DeclIR([(name, t)], line, self.compile_expr(st.value))
+
         if isinstance(st, ast.Expr):
+            if isinstance(st.value, ast.Constant) and isinstance(st.value.value, str):
+                return None  # a bare string is a comment
             if isinstance(st.value, ast.Call):
                 callee = self.resolve_callee(st.value.func)
                 if callee:
                     return self.call(st.value, callee, [], line)
-                self.err(line, self.col(st), f"`{self._callee_name(st.value.func)}` is not a step or flow; "
-                                             f"flows can only call steps and flows", "E209")
+                f = st.value.func
+                if isinstance(f, ast.Name) and f.id in LOG_FUNCS and f.id not in self.scope:
+                    return self.log_call(st.value, f.id, line)
+                if self._is_method_call(f):
+                    self.expr(st.value)
+                    return ExprIR(self.compile_expr(st.value), line)
+                self.err(line, self.col(st), self._not_callable_msg(f), "E209")
                 return None
             self.err(line, self.col(st), "this expression does nothing; flows can only call steps and flows", "E210")
             return None
@@ -386,39 +473,32 @@ class Checker:
                 if not isinstance(tnode, ast.Name):
                     self.err(line, self.col(st), "can only assign to a variable", "E211")
                     return None
+                if tnode.id not in self.scope:
+                    self.err(line, self.col(st), f"`{tnode.id}` is not defined yet", "E212")
+                    return None
                 value = ast.copy_location(ast.BinOp(left=ast.Name(tnode.id, ast.Load()), op=st.op,
                                                     right=st.value), st.value)
-            targets: list[str] = []
             if isinstance(tnode, ast.Name):
-                targets = [tnode.id]
-                is_tuple = False
+                targets, is_tuple = [tnode.id], False
             elif isinstance(tnode, (ast.Tuple, ast.List)) and all(isinstance(e, ast.Name) for e in tnode.elts):
-                targets = [e.id for e in tnode.elts]
-                is_tuple = True
+                targets, is_tuple = [e.id for e in tnode.elts], True  # type: ignore[attr-defined]
             else:
                 self.err(line, self.col(st), "can only assign to a variable or a tuple of variables", "E211")
                 return None
             for t in targets:
                 if t in RESERVED:
-                    self.err(line, self.col(st), f"`{t}` is reserved", "E201")
-                elif t not in self.scope:
-                    self.err(line, self.col(st), f"`{t}` is not declared; declare it first, e.g. `int {t}`", "E212")
+                    self.err(line, self.col(st), f"`{t}` is reserved and cannot be assigned in a flow", "E201")
+                    return None
             if isinstance(value, ast.Call):
                 callee = self.resolve_callee(value.func)
                 if callee:
-                    if not is_tuple and len(callee.outputs) > 1:
-                        self.err(line, self.col(st), f"{callee.kind} `{callee.label}` returns "
-                                                     f"{len(callee.outputs)} values; unpack them with "
-                                                     f"`({', '.join(p.name for p in callee.outputs)}) = ...`", "E213")
                     return self.call(value, callee, targets, line)
             if is_tuple:
                 self.err(line, self.col(st), "tuple assignment is only allowed from a step or flow call", "E211")
                 return None
             vt = self.expr(value)
-            target_t = self.scope.get(targets[0])
-            if not self.compatible(target_t, vt):
-                self.err(line, self.col(st), f"cannot assign {vt} to `{targets[0]}` of type {target_t}", "E214")
-            return AssignIR(targets[0], target_t, self.compile_expr(value), line)
+            self.declare(targets[0], vt, line, self.col(st))
+            return AssignIR(targets[0], self.scope.get(targets[0], ANY), self.compile_expr(value), line)
 
         if isinstance(st, ast.If):
             ident = f"if#{self.counters['if']}"
@@ -427,11 +507,11 @@ class Checker:
             node: ast.stmt | None = st
             arm = 0
             while node is not None:
-                self.expr(node.test)
+                self.expr(node.test)  # type: ignore[attr-defined]
                 label = "then" if arm == 0 else f"elif{arm}"
-                branches.append((label, self.compile_expr(node.test), self.block(node.body)))
+                branches.append((label, self.compile_expr(node.test), self.block(node.body)))  # type: ignore
                 arm += 1
-                orelse = node.orelse
+                orelse = node.orelse  # type: ignore[attr-defined]
                 if len(orelse) == 1 and isinstance(orelse[0], ast.If):
                     node = orelse[0]
                 else:
@@ -445,76 +525,103 @@ class Checker:
             self.counters["for"] += 1
             if st.orelse:
                 self.err(line, self.col(st), "`for ... else` is not supported", "E215")
-            if not isinstance(st.target, ast.Name):
-                self.err(line, self.col(st), "loop variable must be a single name", "E215")
+            if isinstance(st.target, ast.Name):
+                var: str | list[str] = st.target.id
+                names = [st.target.id]
+            elif isinstance(st.target, (ast.Tuple, ast.List)) and all(isinstance(e, ast.Name)
+                                                                      for e in st.target.elts):
+                names = [e.id for e in st.target.elts]  # type: ignore[attr-defined]
+                var = names
+            else:
+                self.err(line, self.col(st), "loop variable must be a name or a tuple of names", "E215")
                 return None
-            var = st.target.id
             it = st.iter
             range_args = iterable = None
-            if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
+            if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
+                    and "range" not in self.scope:
                 if not 1 <= len(it.args) <= 3 or it.keywords:
                     self.err(line, self.col(it), "range() takes 1 to 3 positional arguments", "E216")
                 for a in it.args:
                     at = self.expr(a)
                     if not self.compatible(T_INT, at):
-                        self.err(line, self.col(a), f"range() arguments must be int, got {at}", "E214")
+                        self.warn(line, self.col(a), f"range() arguments should be int, got {at}")
                 range_args = [self.compile_expr(a) for a in it.args]
-                var_t: TypeRef | None = T_INT
+                var_t = T_INT
             else:
                 itt = self.expr(it)
-                if itt is not None and not itt.array and itt not in (T_ARR, T_STR, T_OBJ):
-                    self.err(line, self.col(it), f"cannot loop over a value of type {itt}", "E216")
-                var_t = itt.element() if itt is not None and itt.array else (T_STR if itt == T_STR else None)
+                if itt.name in ("int", "float", "bool", "none") and not itt.array:
+                    self.warn(line, self.col(it), f"cannot loop over a value of type {itt}", "E216")
+                var_t = itt.element() if itt.array else (T_STR if itt == T_STR else ANY)
                 iterable = self.compile_expr(it)
-            if var in RESERVED:
-                self.err(line, self.col(st), f"`{var}` is reserved", "E201")
-            if var in self.scope:
-                if not self.compatible(self.scope[var], var_t):
-                    self.err(line, self.col(st), f"loop variable `{var}` is {self.scope[var]}, "
-                                                 f"but the loop yields {var_t}", "E214")
-            else:
-                self.scope[var] = var_t
-                if var_t is not None:
-                    self.decls[var] = var_t
-            return ForIR(ident, var, range_args, iterable, self.block(st.body), line)
+            for n in names:
+                self.declare(n, var_t if len(names) == 1 else ANY, line, self.col(st))
+            self.loop_depth += 1
+            body = self.block(st.body)
+            self.loop_depth -= 1
+            return ForIR(ident, var, range_args, iterable, body, line)
 
         if isinstance(st, ast.Return):
-            outs = self.cur.outputs
-            if st.value is None:
-                values = []
-            elif isinstance(st.value, ast.Tuple):
-                values = list(st.value.elts)
-            else:
-                values = [st.value]
-            if len(values) != len(outs):
-                self.err(line, self.col(st), f"flow `{self.cur.name}` returns {len(outs)} value(s), "
-                                             f"but this `return` gives {len(values)}", "E217")
-            for v, o in zip(values, outs):
-                vt = self.expr(v)
-                if not self.compatible(o.type, vt):
-                    self.err(line, self.col(v), f"output `{o.name}` is {o.type}, got {vt}", "E214")
-            return ReturnIR([self.compile_expr(v) for v in values], line)
+            return self.ret(st)
 
         kind = type(st).__name__
-        self.err(line, self.col(st), f"`{kind}` is not allowed in a flow; flows may only declare variables, "
-                                     f"assign, call steps or flows, use if/for, and return", "E218")
+        self.err(line, self.col(st), f"`{kind}` is not allowed in a flow; flows may assign variables, call steps "
+                                     f"and flows, log, use if/for, and return. Put other code in a @step",
+                 "E218")
         return None
+
+    def ret(self, st: ast.Return) -> ReturnIR:
+        line = st.lineno
+        outs = self.cur.outputs or []  # type: ignore[union-attr]
+        v = st.value
+        if v is None or (isinstance(v, ast.Constant) and v.value is None and not outs):
+            values: list[ast.expr] = []
+        elif isinstance(v, ast.Dict) and len(outs) >= 1 and v.keys and all(
+                isinstance(k, ast.Constant) and isinstance(k.value, str) for k in v.keys) \
+                and {k.value for k in v.keys} == {o.name for o in outs}:  # type: ignore[union-attr]
+            by_key = {k.value: val for k, val in zip(v.keys, v.values)}  # type: ignore[union-attr]
+            values = [by_key[o.name] for o in outs]
+        elif isinstance(v, ast.Dict) and len(outs) > 1:
+            self.err(line, self.col(st), f"return keys must be the flow's outputs: "
+                                         f"{', '.join(o.name for o in outs)}", "E217")
+            return ReturnIR([], line)
+        elif isinstance(v, ast.Tuple) and len(outs) != 1:
+            values = list(v.elts)
+        else:
+            values = [v]
+        if len(values) != len(outs):
+            self.err(line, self.col(st), f"flow `{self.cur.name}` returns {len(outs)} value(s), "  # type: ignore
+                                         f"but this `return` gives {len(values)}", "E217")
+        for val, o in zip(values, outs):
+            vt = self.expr(val)
+            if not self.compatible(o.type, vt):
+                self.warn(line, self.col(val), f"output `{o.name}` is {o.type}, got {vt}")
+        return ReturnIR([(o.name, self.compile_expr(val)) for val, o in zip(values, outs)], line)
+
+    def log_call(self, node: ast.Call, func: str, line: int) -> LogIR:
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            self.err(line, self.col(node), "*args and **kwargs are not allowed in flow calls", "E219")
+        for a in node.args:
+            if not isinstance(a, ast.Starred):
+                self.expr(a)
+        for k in node.keywords:
+            self.expr(k.value)
+        return LogIR(func, [self.compile_expr(a) for a in node.args if not isinstance(a, ast.Starred)],
+                     {k.arg: self.compile_expr(k.value) for k in node.keywords if k.arg}, line)
 
     def call(self, node: ast.Call, callee: Callee, targets: list[str], line: int) -> CallIR:
         if self.cur and callee.kind == "flow" and callee.package is None:
             self.calls.setdefault(self.cur.name, set()).add(callee.name)
-        n_args = len(node.args) + len(node.keywords)
         if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
             self.err(line, self.col(node), "*args and **kwargs are not allowed in flow calls", "E219")
-        if n_args != len(callee.params):
-            self.err(line, self.col(node), f"{callee.kind} `{callee.label}` takes {len(callee.params)} "
-                                           f"argument(s) ({', '.join(p.name for p in callee.params)}), "
-                                           f"but {n_args} were given", "E220")
         pnames = [p.name for p in callee.params]
+        if len(node.args) > len(callee.params):
+            self.err(line, self.col(node), f"{callee.kind} `{callee.label}` takes {len(callee.params)} "
+                                           f"argument(s) ({', '.join(pnames)}), but {len(node.args)} positional "
+                                           f"were given", "E220")
         for a, p in zip(node.args, callee.params):
             at = self.expr(a)
             if not self.compatible(p.type, at):
-                self.err(line, self.col(a), f"argument `{p.name}` of `{callee.label}` is {p.type}, got {at}", "E214")
+                self.warn(line, self.col(a), f"argument `{p.name}` of `{callee.label}` is {p.type}, got {at}")
         given = set(pnames[: len(node.args)])
         for k in node.keywords:
             if k.arg is None:
@@ -527,27 +634,41 @@ class Checker:
                 p = callee.params[pnames.index(k.arg)]
                 at = self.expr(k.value)
                 if not self.compatible(p.type, at):
-                    self.err(line, self.col(k.value), f"argument `{p.name}` of `{callee.label}` is {p.type}, "
-                                                      f"got {at}", "E214")
+                    self.warn(line, self.col(k.value), f"argument `{p.name}` of `{callee.label}` is {p.type}, "
+                                                       f"got {at}")
             given.add(k.arg)
+        missing = [p.name for p in callee.params if not p.has_default and p.name not in given]
+        if missing:
+            self.err(line, self.col(node), f"{callee.kind} `{callee.label}` is missing input(s): "
+                                           f"{', '.join(missing)}", "E220")
+
+        outs = callee.outputs
         if targets:
-            if len(targets) > 1 and len(targets) != len(callee.outputs):
-                self.err(line, self.col(node), f"unpacking {len(targets)} values, but {callee.kind} "
-                                               f"`{callee.label}` returns {len(callee.outputs)}", "E221")
-            elif len(callee.outputs) == 0:
+            if outs is None:
+                for t in targets:
+                    self.declare(t, ANY, line, self.col(node))
+            elif len(outs) == 0:
                 self.err(line, self.col(node), f"{callee.kind} `{callee.label}` returns nothing", "E221")
+            elif len(targets) == 1:
+                if len(outs) == 1:
+                    t_out = outs[0].type
+                else:
+                    t_out = T_LIST if is_tuple_outputs(outs) else T_DICT
+                self.declare(targets[0], t_out, line, self.col(node))
+            elif len(targets) != len(outs):
+                self.err(line, self.col(node), f"unpacking {len(targets)} values, but {callee.kind} "
+                                               f"`{callee.label}` returns {len(outs)} "
+                                               f"({', '.join(o.name for o in outs)})", "E221")
             else:
-                for t, o in zip(targets, callee.outputs):
-                    if t in self.scope and not self.compatible(self.scope[t], o.type):
-                        self.err(line, self.col(node), f"`{t}` is {self.scope[t]}, but output `{o.name}` "
-                                                       f"of `{callee.label}` is {o.type}", "E214")
+                for t, o in zip(targets, outs):
+                    self.declare(t, o.type, line, self.col(node))
         args = [self.compile_expr(a) for a in node.args if not isinstance(a, ast.Starred)]
         kwargs = {k.arg: self.compile_expr(k.value) for k in node.keywords if k.arg}
         return CallIR(callee, args, kwargs, targets, line)
 
     # -- expressions
-    def expr(self, node: ast.expr) -> TypeRef | None:
-        line = getattr(node, "lineno", self.cur.line)
+    def expr(self, node: ast.expr) -> TypeRef:
+        line = getattr(node, "lineno", self.cur.line if self.cur else 1)
         if isinstance(node, ast.Constant):
             v = node.value
             if isinstance(v, bool):
@@ -559,67 +680,78 @@ class Checker:
             if isinstance(v, str):
                 return T_STR
             if v is None:
-                return None
+                return T_NONE
             self.err(line, self.col(node), f"literal {v!r} is not supported", "E222")
-            return None
+            return ANY
         if isinstance(node, ast.Name):
-            if node.id == "env":
-                return None  # the run environment: any key, any type
-            if node.id in RESERVED:
-                self.err(line, self.col(node), f"`{node.id}` is not available in flows", "E201")
-                return None
-            if node.id in self.scope:
-                return self.scope[node.id]
-            if node.id in BUILTINS:
-                self.err(line, self.col(node), f"builtin `{node.id}` can only be called", "E223")
-                return None
-            if node.id in JSON_WORDS:
+            n = node.id
+            if n in self.scope:
+                return self.scope[n]
+            if n in ("env", "context"):
+                return ANY
+            if n in self.constants:
+                return ANY
+            if n in BUILTINS:
+                self.err(line, self.col(node), f"builtin `{n}` can only be called", "E223")
+                return ANY
+            if n in JSON_WORDS:
                 c = self.col(node)
-                self.err(line, c, json_word_message(node.id), "E235", end_col=c + len(node.id))
-                return None
-            self.err(line, self.col(node), f"`{node.id}` is not declared", "E212")
-            return None
+                self.err(line, c, json_word_message(n), "E235", end_col=c + len(n))
+                return ANY
+            if n in self.steps or n in self.flows:
+                self.err(line, self.col(node), f"`{n}` must be called as its own statement, "
+                                               f"e.g. `x = {n}(...)`", "E226")
+                return ANY
+            if n in COCO_API:
+                self.err(line, self.col(node), f"`{n}` cannot be used as a value in a flow", "E201")
+                return ANY
+            self.err(line, self.col(node), f"`{n}` is not defined", "E212")
+            return ANY
         if isinstance(node, ast.Attribute):
             if node.attr.startswith("_"):
                 self.err(line, self.col(node), f"attribute `{node.attr}` is not accessible in flows", "E224")
-                return None
+                return ANY
             bt = self.expr(node.value)
             cd = self.class_def(bt)
             if cd is not None:
                 for f in cd.fields:
                     if f.name == node.attr:
                         alias = bt.name.rpartition(".")[0] if "." in bt.name else None
-                        return self.qualify(f.type, alias)
-                self.err(line, self.col(node), f"class `{cd.name}` has no field `{node.attr}`", "E225")
-            return None
+                        if alias:
+                            return self.qualify(f.type, alias, self.imports[alias].module.classes_by_name)
+                        return f.type
+                self.warn(line, self.col(node), f"class `{cd.name}` has no field `{node.attr}`", "E225")
+            return ANY
         if isinstance(node, ast.Subscript):
             bt = self.expr(node.value)
-            self.expr(node.slice) if not isinstance(node.slice, ast.Slice) else self._slice(node.slice)
             if isinstance(node.slice, ast.Slice):
+                for part in (node.slice.lower, node.slice.upper, node.slice.step):
+                    if part is not None:
+                        self.expr(part)
                 return bt
-            if bt is not None and bt.array:
+            self.expr(node.slice)
+            if bt.array:
                 return bt.element()
             if bt == T_STR:
                 return T_STR
-            return None
+            return ANY
         if isinstance(node, ast.BinOp):
             lt, rt = self.expr(node.left), self.expr(node.right)
             if isinstance(node.op, ast.Add) and T_STR in (lt, rt):
-                return T_STR if lt == rt else (None if None in (lt, rt) else T_STR)
-            if isinstance(node.op, ast.Div):
+                return T_STR
+            if isinstance(node.op, ast.Div) and lt.name in ("int", "float") and rt.name in ("int", "float"):
                 return T_FLOAT
             if lt in (T_INT, T_FLOAT) and rt in (T_INT, T_FLOAT):
                 return T_FLOAT if T_FLOAT in (lt, rt) else T_INT
-            if isinstance(node.op, ast.Add) and lt is not None and rt is not None and lt.array and rt.array:
+            if isinstance(node.op, ast.Add) and lt.array and rt.array:
                 return lt
-            return None
+            return ANY
         if isinstance(node, ast.UnaryOp):
             t = self.expr(node.operand)
             return T_BOOL if isinstance(node.op, ast.Not) else t
         if isinstance(node, ast.BoolOp):
-            for v in node.values:
-                self.expr(v)
-            return T_BOOL
+            ts = [self.expr(v) for v in node.values]
+            return ts[0] if all(t == ts[0] for t in ts) else ANY
         if isinstance(node, ast.Compare):
             self.expr(node.left)
             for c in node.comparators:
@@ -628,18 +760,18 @@ class Checker:
         if isinstance(node, ast.IfExp):
             self.expr(node.test)
             a, b = self.expr(node.body), self.expr(node.orelse)
-            return a if a == b else None
+            return a if a == b else ANY
         if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
             for e in node.elts:
                 self.expr(e)
-            return T_ARR
+            return T_LIST
         if isinstance(node, ast.Dict):
             for k in node.keys:
                 if k is not None:
                     self.expr(k)
             for v in node.values:
                 self.expr(v)
-            return T_OBJ
+            return T_DICT
         if isinstance(node, ast.JoinedStr):
             for v in node.values:
                 if isinstance(v, ast.FormattedValue):
@@ -651,23 +783,48 @@ class Checker:
                     and self._is_env(f.value)):
                 for a in node.args:
                     self.expr(a)
-                return None  # env.get("key", default)
-            if isinstance(node.func, ast.Name) and node.func.id in BUILTINS and node.func.id not in self.scope:
+                return ANY  # env.get("key", default)
+            if isinstance(f, ast.Name) and f.id in BUILTINS and f.id not in self.scope:
                 for a in node.args:
                     self.expr(a)
                 for k in node.keywords:
                     self.expr(k.value)
-                return BUILTINS[node.func.id]
-            callee = self.resolve_callee(node.func)
+                return BUILTINS[f.id]
+            callee = self.resolve_callee(f)
+            if callee is None and self._is_method_call(f):
+                self.expr(f.value)  # type: ignore[attr-defined]
+                for a in node.args:
+                    self.expr(a.value if isinstance(a, ast.Starred) else a)
+                for k in node.keywords:
+                    self.expr(k.value)
+                return ANY  # a method of a value: text.upper(), items.get("k")
             if callee:
                 self.err(line, self.col(node), f"{callee.kind} `{callee.label}` must be called as its own "
                                                f"statement, e.g. `x = {callee.label}(...)`", "E226")
+            elif isinstance(f, ast.Name) and (f.id in self.helpers or f.id in self.classes):
+                self.err(line, self.col(node), self._not_callable_msg(f), "E227")
             else:
-                self.err(line, self.col(node), f"`{self._callee_name(node.func)}` cannot be called in a flow "
+                self.err(line, self.col(node), f"`{self._callee_name(f)}` cannot be called in a flow "
                                                f"expression; allowed: {', '.join(sorted(BUILTINS))}", "E227")
-            return None
-        self.err(line, self.col(node), f"`{type(node).__name__}` is not allowed in flow expressions", "E228")
-        return None
+            return ANY
+        self.err(line, self.col(node), f"`{type(node).__name__}` is not allowed in flow expressions; "
+                                       f"do this in a @step", "E228")
+        return ANY
+
+    def _is_method_call(self, func: ast.expr) -> bool:
+        """`value.method(...)` where value is data (a variable, literal or expression), not a module,
+        workflow, class or helper."""
+        if not isinstance(func, ast.Attribute) or func.attr.startswith("_"):
+            return False
+        root = func.value
+        while isinstance(root, (ast.Attribute, ast.Subscript, ast.Call)):
+            root = root.func if isinstance(root, ast.Call) else root.value
+        if isinstance(root, ast.Name):
+            n = root.id
+            if n in self.scope or n in self.constants or n == "env":
+                return True
+            return False
+        return isinstance(root, (ast.Constant, ast.List, ast.Dict, ast.Tuple, ast.JoinedStr, ast.Set))
 
     @staticmethod
     def _is_env(node: ast.expr) -> bool:
@@ -675,11 +832,6 @@ class Checker:
         while isinstance(node, (ast.Attribute, ast.Subscript)):
             node = node.value
         return isinstance(node, ast.Name) and node.id == "env"
-
-    def _slice(self, s: ast.Slice) -> None:
-        for part in (s.lower, s.upper, s.step):
-            if part is not None:
-                self.expr(part)
 
 
 def find_python_module(name: str) -> bool:

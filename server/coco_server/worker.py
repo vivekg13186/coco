@@ -110,7 +110,8 @@ class RunManager:
         with self._lock:
             prog = self._programs.get(version["id"])
         if prog is None:
-            prog = coco.compile(version["source"], f"{name}.coco", store.make_loader(self.db, exclude=name))
+            prog = coco.compile(version["source"], f"{name}.coco", store.make_loader(self.db, exclude=name),
+                                name=name)
             with self._lock:
                 self._programs[version["id"]] = prog
         return prog

@@ -24,7 +24,7 @@ Settings come from flags or environment variables: `COCO_DB`, `COCO_HOST`, `COCO
 
 ```bash
 B=http://127.0.0.1:8765/api/v1
-jq -n --rawfile s examples/onboard.coco '{source: $s}' | curl -s -X POST $B/workflows -H 'content-type: application/json' -d @-
+jq -n --rawfile s examples/onboard.coco '{name: "onboard", source: $s}' | curl -s -X POST $B/workflows -H 'content-type: application/json' -d @-
 jq -n --slurpfile i examples/onboard.input.json '{input: $i[0]}' \
   | curl -s -X POST $B/workflows/onboard/flows/onboard/runs -H 'content-type: application/json' -d @-
 curl -N $B/runs/<run id>/stream          # every event in order, then `event: end`
@@ -56,7 +56,8 @@ Every error is `{"error": {"code", "message", "details"?}}`.
 
 ## How it works
 
-- **Workflows and versions:** the package name is the workflow name. Saving changed source adds an
+- **Workflows and versions:** a workflow's name is set when it is created (`POST /workflows` with `name`)
+  and can be changed with `PUT` (`name`); it must be a Python identifier. Saving changed source adds an
   immutable version, valid or not; only valid versions can run. `import other` resolves to the current
   version of the workflow named `other`.
 - **Runs:** `POST .../runs` stores a `queued` run and submits it to a `ThreadPoolExecutor`

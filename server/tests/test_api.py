@@ -12,21 +12,24 @@ EXAMPLES = Path(__file__).parent.parent.parent / "examples"
 API = "/api/v1"
 
 SLOW = """
-package slow
+import time
+from coco import step, flow, log
 
-step tick(int i)(int out):
-    import time
+
+@step
+def tick(i: int) -> int:
     time.sleep(0.05)
-    self.log_value("i", i)
+    log("i =", i)
     return i
 
-flow count(int n)(int total):
-    int t = 0
-    int x
+
+@flow
+def count(n: int) -> {"total": int}:
+    t = 0
     for i in range(n):
         x = tick(i)
         t = t + x
-    return t
+    return {"total": t}
 """
 
 
@@ -41,8 +44,8 @@ def client(settings):
         yield c
 
 
-def create(client, source, **kw):
-    r = client.post(f"{API}/workflows", json={"source": source, **kw})
+def create(client, source, name, **kw):
+    r = client.post(f"{API}/workflows", json={"source": source, "name": name, **kw})
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -73,13 +76,13 @@ def test_health(client):
 
 def test_workflow_crud_and_versions(client):
     src = (EXAMPLES / "onboard.coco").read_text()
-    wf = create(client, src, description="team onboarding")
+    wf = create(client, src, "onboard", description="team onboarding")
     assert wf["name"] == "onboard"
     v = wf["current_version"]
     assert v["version"] == 1 and v["is_valid"] and [f["name"] for f in v["flows"]] == ["notify_member", "onboard"]
     assert v["symbols"]["classes"][0]["name"] == "Person"
 
-    dup = client.post(f"{API}/workflows", json={"source": src})
+    dup = client.post(f"{API}/workflows", json={"source": src, "name": "onboard"})
     assert dup.status_code == 409 and dup.json()["error"]["code"] == "duplicate_name"
 
     same = client.put(f"{API}/workflows/{wf['id']}", json={"source": src}).json()
@@ -96,35 +99,44 @@ def test_workflow_crud_and_versions(client):
     listed = client.get(f"{API}/workflows", params={"q": "onb"}).json()
     assert listed["total"] == 1 and "source" not in listed["items"][0]["current_version"]
 
+    renamed = client.put(f"{API}/workflows/onboard", json={"name": "team_onboard"}).json()
+    assert renamed["name"] == "team_onboard" and renamed["current_version"]["version"] == 2
+    bad = client.put(f"{API}/workflows/team_onboard", json={"name": "not valid"})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_name"
+
     assert client.delete(f"{API}/workflows/{wf['id']}").status_code == 204
     assert client.get(f"{API}/workflows/{wf['id']}").json()["error"]["code"] == "not_found"
 
 
-def test_missing_package_and_error_shape(client):
-    r = client.post(f"{API}/workflows", json={"source": "flow f()():\n    pass\n"})
-    assert r.status_code == 422 and r.json()["error"]["code"] == "missing_package"
-    r = client.post(f"{API}/workflows", json={"nope": 1})
+def test_name_is_required_and_error_shape(client):
+    r = client.post(f"{API}/workflows", json={"source": "x = 1\n", "name": ""})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "missing_name"
+    for bad in ("2fast", "my-flow", "class", "coco"):
+        r = client.post(f"{API}/workflows", json={"source": "x = 1\n", "name": bad})
+        assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_name", bad
+    r = client.post(f"{API}/workflows", json={"source": "x = 1\n"})
     assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_request"
     assert client.get(f"{API}/nothing").json()["error"]["code"] == "not_found"
 
 
 def test_validate_reports_diagnostics(client):
-    src = (Path(__file__).parent.parent.parent / "core" / "tests" / "golden" / "coco_md_sample.coco").read_text()
-    r = client.post(f"{API}/validate", json={"source": src}).json()
-    assert r["is_valid"] is False and r["package"] == "maind"
-    assert {d["code"] for d in r["diagnostics"]} >= {"E205", "E220", "E221", "E212"}
-    assert r["symbols"]["flows"][0]["name"] == "flow1"
+    src = "from coco import step, flow\n@step\ndef s(a: int) -> int:\n    return a\n" \
+          "@flow\ndef f():\n    x = s()\n    while True:\n        pass\n    return y\n"
+    r = client.post(f"{API}/validate", json={"source": src, "name": "demo"}).json()
+    assert r["is_valid"] is False and r["symbols"]["workflow"] == "demo"
+    assert {d["code"] for d in r["diagnostics"]} >= {"E220", "E218", "E212"}
+    assert r["symbols"]["flows"][0]["name"] == "f"
 
 
 def test_invalid_workflow_is_saved_but_cannot_run(client):
-    wf = create(client, "package broken\nflow f()(int a):\n    pass\n")
+    wf = create(client, "from coco import flow\n@flow\ndef f() -> int:\n    pass\n", "broken")
     assert wf["current_version"]["is_valid"] is False
     r = client.post(f"{API}/workflows/broken/flows/f/runs", json={})
     assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_workflow"
 
 
 def test_run_with_wait_and_events(client):
-    create(client, (EXAMPLES / "onboard.coco").read_text())
+    create(client, (EXAMPLES / "onboard.coco").read_text(), "onboard")
     inp = json.loads((EXAMPLES / "onboard.input.json").read_text())
     r = client.post(f"{API}/workflows/onboard/flows/onboard/runs", json={"input": inp, "wait": True})
     assert r.status_code == 201
@@ -146,13 +158,13 @@ def test_run_with_wait_and_events(client):
 
 
 def test_bad_input_fails_the_run(client):
-    create(client, (EXAMPLES / "hello.coco").read_text())
+    create(client, (EXAMPLES / "hello.coco").read_text(), "hello")
     run = client.post(f"{API}/workflows/hello/flows/main/runs", json={"input": {"who": 1}, "wait": True}).json()
     assert run["status"] == "failed" and run["error"]["code"] == "invalid_input"
 
 
 def test_stream_replays_finished_run(client):
-    create(client, (EXAMPLES / "hello.coco").read_text())
+    create(client, (EXAMPLES / "hello.coco").read_text(), "hello")
     run = client.post(f"{API}/workflows/hello/flows/main/runs",
                       json={"input": {"name": "Ada"}, "wait": True}).json()
     text = client.get(f"{API}/runs/{run['id']}/stream").text
@@ -166,7 +178,7 @@ def test_stream_replays_finished_run(client):
 
 
 def test_stream_live_run_gets_every_event_once(client):
-    create(client, SLOW)
+    create(client, SLOW, "slow")
     run = client.post(f"{API}/workflows/slow/flows/count/runs", json={"input": {"n": 6}}).json()
     assert run["status"] in ("queued", "running")
     with client.stream("GET", f"{API}/runs/{run['id']}/stream") as r:
@@ -180,7 +192,7 @@ def test_stream_live_run_gets_every_event_once(client):
 
 
 def test_cancel_and_rerun(client):
-    create(client, SLOW)
+    create(client, SLOW, "slow")
     run = client.post(f"{API}/workflows/slow/flows/count/runs", json={"input": {"n": 100}}).json()
     time.sleep(0.2)
     assert client.post(f"{API}/runs/{run['id']}/cancel").json()["cancel_requested"] is True
@@ -196,9 +208,9 @@ def test_cancel_and_rerun(client):
 
 
 def test_run_list_filters_and_delete(client):
-    create(client, (EXAMPLES / "hello.coco").read_text())
+    create(client, (EXAMPLES / "hello.coco").read_text(), "hello")
     ok = client.post(f"{API}/workflows/hello/flows/main/runs", json={"input": {"name": "a"}, "wait": True}).json()
-    bad = client.post(f"{API}/workflows/hello/flows/main/runs", json={"input": {}, "wait": True}).json()
+    bad = client.post(f"{API}/workflows/hello/flows/main/runs", json={"input": {"x": 1}, "wait": True}).json()
     assert client.get(f"{API}/runs").json()["total"] == 2
     failed = client.get(f"{API}/runs", params={"status": "failed"}).json()
     assert [r["id"] for r in failed["items"]] == [bad["id"]]
@@ -210,7 +222,7 @@ def test_run_list_filters_and_delete(client):
 
 
 def test_delete_workflow_with_active_run_is_refused(client):
-    create(client, SLOW)
+    create(client, SLOW, "slow")
     run = client.post(f"{API}/workflows/slow/flows/count/runs", json={"input": {"n": 40}}).json()
     r = client.delete(f"{API}/workflows/slow")
     assert r.status_code == 409 and r.json()["error"]["code"] == "runs_active"
@@ -219,10 +231,11 @@ def test_delete_workflow_with_active_run_is_refused(client):
 
 
 def test_import_another_workflow(client):
-    create(client, "package shared\nclass Item:\n    string sku\nstep price(Item it)(float p):\n    return 9.5\n")
-    main = ("package shop\nimport shared\nflow total(shared.Item it, int n)(float t):\n    float p\n"
-            "    p = shared.price(it)\n    return p * n\n")
-    wf = create(client, main)
+    create(client, "from coco import step\nclass Item:\n    sku: str\n@step\ndef price(it: Item) -> float:\n"
+                   "    return 9.5\n", "shared")
+    main = ("from coco import flow\nimport shared\n@flow\ndef total(it: shared.Item, n: int) -> {\"t\": float}:\n"
+            "    p = shared.price(it)\n    return {\"t\": p * n}\n")
+    wf = create(client, main, "shop")
     assert wf["current_version"]["is_valid"], wf["current_version"]["diagnostics"]
     run = client.post(f"{API}/workflows/shop/flows/total/runs",
                       json={"input": {"it": {"sku": "A"}, "n": 2}, "wait": True}).json()
@@ -241,7 +254,7 @@ def test_api_token(tmp_path):
 def test_startup_marks_interrupted_runs_failed(tmp_path):
     s = Settings(db_path=str(tmp_path / "r.db"))
     with TestClient(create_app(s)) as c:
-        wf = create(c, (EXAMPLES / "hello.coco").read_text())
+        wf = create(c, (EXAMPLES / "hello.coco").read_text(), "hello")
     db = Database(s.db_path)
     with db.tx() as conn:
         conn.execute("INSERT INTO run (id, workflow_id, version_id, flow_name, status, trigger, input, queued_at) "

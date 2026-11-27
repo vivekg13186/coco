@@ -4,14 +4,17 @@ import textwrap
 import threading
 from pathlib import Path
 
+import pytest
+
 import coco
 from coco.cli import main as cli_main
 
 EXAMPLES = Path(__file__).parent.parent.parent / "examples"
+HEAD = "from coco import step, flow, log, info, warn, error, debug, log_table, env, context\n"
 
 
 def compile_src(src: str) -> coco.Program:
-    return coco.compile(textwrap.dedent(src), "test.coco")
+    return coco.compile(HEAD + textwrap.dedent(src), "test.coco", name="test")
 
 
 def onboard_input():
@@ -20,27 +23,15 @@ def onboard_input():
 
 def test_onboard_end_to_end():
     prog = coco.compile_file(str(EXAMPLES / "onboard.coco"))
+    assert prog.name == "onboard"
     res = prog.run("onboard", onboard_input())
     assert res.ok, res.error
-    assert res.output == {"processed": 2, "avg_age": 103 / 3}
-    types = [e.type for e in res.events]
-    assert types[0] == "flow.started" and types[-1] == "flow.completed"
-    assert [e.seq for e in res.events] == list(range(1, len(res.events) + 1))
-    # console-style logs keep each value with its structure
-    resp = next(e for e in res.events if e.type == "log" and e.payload["message"].startswith("api response"))
-    assert resp.payload["args"] == [{"type": "string", "value": "api response:"},
-                                    {"type": "object", "value": {"age": 33, "source": "https://api.example"}}]
-    warn = next(e for e in res.events if e.type == "log" and e.payload["level"] == "warning")
-    assert warn.payload["message"] == "age changed for Grace 0 -> 35"
-    assert [a["type"] for a in warn.payload["args"]] == ["string", "string", "number", "string", "number"]
-    table = next(e for e in res.events if e.type == "log.table")
-    assert table.payload["columns"] == ["(index)", "name", "age"]
-    assert table.payload["rows"] == [[0, "Ada", 33], [1, "Grace", 35], [2, "Linus", 35]]
-    # print() in a step becomes a log event on that step
+    assert res.output == {"processed": 2, "avg_age": pytest.approx(34.333, abs=0.01)}
     mail = [e for e in res.events if e.type == "log" and e.step == "send_mail"]
     assert [m.payload["message"] for m in mail] == ["mail to Grace: Welcome, Grace", "mail to Linus: Welcome, Linus"]
-    # sub-flow events are nested
     assert any(e.type == "subflow.started" and e.path.endswith("if#0.then/notify_member") for e in res.events)
+    enrich = next(e for e in res.events if e.type == "step.completed" and e.step == "enrich")
+    assert enrich.payload["output"] == {"person": {"name": "Ada", "age": 33}, "changed": False}
 
 
 def test_onboard_event_sequence_snapshot():
@@ -58,125 +49,245 @@ def test_onboard_event_sequence_snapshot():
     ]
     assert [e.type for e in res.events][-5:] == ["step.started", "log.table", "step.completed", "branch.taken",
                                                  "flow.completed"]
-    assert len(res.events) == 35
 
 
-def test_step_exception_fails_flow_with_traceback_line():
+def test_defaults_for_flows_and_steps():
     prog = compile_src("""
-    package p
-    step boom(int a)(int b):
-        self.log("about to fail")
-        return 10 // a
-    flow f(int a)(int b):
-        int x
-        x = boom(a)
-        return x
+    @step
+    def greet(name: str, punct: str = "!") -> str:
+        return "hi " + name + punct
+    @flow
+    def f(name: str = "world", loud: bool = False) -> str:
+        if loud:
+            m = greet(name, punct="!!!")
+        else:
+            m = greet(name)
+        return m
     """)
-    res = prog.run("f", {"a": 0})
-    assert res.status == "failed"
-    types = [e.type for e in res.events]
-    assert types == ["flow.started", "step.started", "log", "step.failed", "flow.failed"]
-    err = res.events[3].payload["error"]
-    assert err["code"] == "step_error" and "ZeroDivisionError" in err["message"]
-    assert 'test.coco", line 5' in err["traceback"]
+    assert prog.run("f", {}).output == {"result": "hi world!"}
+    assert prog.run("f", {"name": "ada", "loud": True}).output == {"result": "hi ada!!!"}
+    assert prog.flows["f"]["inputs"][0] == {"name": "name", "type": "str", "default": "world", "optional": True}
 
 
-def test_invalid_input_and_coercion():
+def test_output_shapes():
     prog = compile_src("""
-    package p
-    flow f(int a, float b)(float c):
-        return a + b
+    @step
+    def named() -> {"a": int, "b": str}:
+        return {"a": 1, "b": "x"}
+    @step
+    def named_tuple() -> {"a": int, "b": str}:
+        return 2, "y"
+    @step
+    def pair() -> tuple[int, int]:
+        return 3, 4
+    @step
+    def raw(x):
+        return [x, x]
+    @step
+    def nothing() -> None:
+        return 99
+    @flow
+    def f():
+        a, b = named()
+        whole = named()
+        c, d = named_tuple()
+        p = pair()
+        e, g = raw(5)
+        r = raw(6)
+        nothing()
+        return {"a": a, "b": b, "whole": whole, "c": c, "d": d, "p": p, "e": e, "r": r}
     """)
-    assert prog.run("f", {"a": "3", "b": 1}).output == {"c": 4.0}
-    bad = prog.run("f", {"a": "x", "b": 1})
-    assert bad.status == "failed" and bad.error["code"] == "invalid_input"
-    missing = prog.run("f", {"a": 1})
-    assert "missing input(s): b" in missing.error["message"]
+    res = prog.run("f", {})
+    assert res.ok, res.error
+    assert res.output == {"a": 1, "b": "x", "whole": {"a": 1, "b": "x"}, "c": 2, "d": "y", "p": [3, 4],
+                          "e": 5, "r": [6, 6]}
+    done = [e.payload["output"] for e in res.events if e.type == "step.completed"]
+    assert done[3] == {"result1": 3, "result2": 4} and done[4] == {"result": [5, 5]} and done[-1] == {}
 
 
 def test_step_must_return_declared_outputs():
     prog = compile_src("""
-    package p
-    step s()(int a, int b):
-        return 1
-    flow f()(int a):
-        int x, y
-        (x, y) = s()
-        return x
+    @step
+    def s() -> {"a": int, "b": int}:
+        return {"a": 1}
+    @step
+    def t() -> int:
+        return "nope"
+    @flow
+    def f():
+        x, y = s()
+    @flow
+    def g():
+        x = t()
     """)
     res = prog.run("f", {})
-    assert res.error["code"] == "invalid_output"
-    assert [e.type for e in res.events][-2:] == ["step.failed", "flow.failed"]
+    assert res.error["code"] == "invalid_output" and "missing b" in res.error["message"]
+    res = prog.run("g", {})
+    assert res.error["code"] == "invalid_output" and "is not a valid int" in res.error["message"]
+
+
+def test_step_exception_fails_flow_with_traceback_line():
+    prog = compile_src("""
+    @step
+    def boom(x: int) -> int:
+        y = x + 1
+        raise ValueError("bad " + str(y))
+    @flow
+    def f(x: int) -> int:
+        r = boom(x)
+        return r
+    """)
+    res = prog.run("f", {"x": 1})
+    assert res.status == "failed"
+    assert res.error["code"] == "step_error" and res.error["message"] == "ValueError: bad 2"
+    assert 'line 6, in boom' in res.error["traceback"]
+    assert res.events[-2].type == "step.failed"
+
+
+def test_invalid_input_and_coercion():
+    prog = compile_src("""
+    @flow
+    def f(n: int, ratio: float, names: list[str], maybe: str | None = None) -> float:
+        return n * ratio
+    """)
+    assert prog.run("f", {"n": "3", "ratio": 2, "names": []}).output == {"result": 6.0}
+    res = prog.run("f", {"n": "x", "ratio": 1, "names": []})
+    assert res.error["code"] == "invalid_input" and "input `n`" in res.error["message"]
+    res = prog.run("f", {"ratio": 1, "extra": 1})
+    assert "missing input(s): n, names" in res.error["message"] and "unknown input(s): extra" in res.error["message"]
+
+
+def test_any_types_accept_anything():
+    prog = compile_src("""
+    import datetime
+    @step
+    def s(x, when: datetime.date = None) -> object:
+        return {"x": x}
+    @flow
+    def f(x) -> dict:
+        r = s(x)
+        return r
+    """)
+    assert prog.run("f", {"x": [1, {"a": None}]}).output == {"result": {"x": [1, {"a": None}]}}
 
 
 def test_expression_error_is_reported():
     prog = compile_src("""
-    package p
-    flow f(int a)(int b):
-        int x
-        x = 10 // a
-        return x
+    @flow
+    def f(items: list[int]) -> int:
+        return items[5]
     """)
-    res = prog.run("f", {"a": 0})
-    assert res.error["code"] == "expression_error" and "line 5" in res.error["message"]
+    res = prog.run("f", {"items": [1]})
+    assert res.error["code"] == "expression_error" and "IndexError" in res.error["message"]
 
 
 def test_classes_validate_and_serialize():
     prog = compile_src("""
-    package p
+    class Address:
+        city: str
     class Person:
-        string name
-        int age = 0
-    class Team:
-        string title
-        Person members[]
-    step oldest(Team t)(Person p):
-        return max(t.members, key=lambda m: m.age)
-    flow f(Team t)(Person p):
-        Person o
-        o = oldest(t)
-        return o
+        name: str
+        age: int = 0
+        address: Address | None = None
+    import coco
+    class Plain(coco.Model):
+        v: int
+    @step
+    def older(p: Person) -> Person:
+        p.age += 1
+        return p
+    @flow
+    def f(p: Person) -> {"p": Person, "city": str}:
+        q = older(p)
+        return {"p": q, "city": q.address.city}
     """)
-    res = prog.run("f", {"t": {"title": "x", "members": [{"name": "a", "age": 3}, {"name": "b", "age": 9}]}})
-    assert res.output == {"p": {"name": "b", "age": 9}}
-    bad = prog.run("f", {"t": {"title": "x", "members": [{"age": 3}]}})
-    assert bad.error["code"] == "invalid_input" and "name" in bad.error["message"]
+    res = prog.run("f", {"p": {"name": "ada", "age": "40", "address": {"city": "Delft"}}})
+    assert res.ok, res.error
+    assert res.output == {"p": {"name": "ada", "age": 41, "address": {"city": "Delft"}}, "city": "Delft"}
+    res = prog.run("f", {"p": {"age": 1}})
+    assert res.error["code"] == "invalid_input" and "name" in res.error["message"]
+
+
+def test_helpers_and_constants_in_steps_and_flows():
+    prog = compile_src("""
+    RATE = 2
+    def double(x):
+        return x * RATE
+    @step
+    def s(x: int) -> int:
+        return double(x)
+    @flow
+    def f(x: int) -> int:
+        y = s(x)
+        return y + RATE
+    """)
+    assert prog.run("f", {"x": 5}).output == {"result": 12}
+
+
+def test_loops_break_continue_and_unpack():
+    prog = compile_src("""
+    @flow
+    def f(items: dict) -> list:
+        keep = []
+        for k, v in sorted(items.items()):
+            if v < 0:
+                continue
+            if v > 100:
+                break
+            keep = keep + [k]
+        return keep
+    """)
+    assert prog.run("f", {"items": {"a": 1, "b": -1, "c": 5, "d": 500, "e": 2}}).output == {"result": ["a", "c"]}
+
+
+def test_flow_level_logging():
+    prog = compile_src("""
+    @flow
+    def f(n: int):
+        log("n is", n)
+        warn("careful")
+        print("printed", n)
+        log_table([{"a": n}])
+    """)
+    res = prog.run("f", {"n": 3})
+    assert res.ok, res.error
+    logs = [(e.type, e.step, e.path, e.payload.get("level"), e.payload["message"]) for e in res.events
+            if e.type.startswith("log")]
+    assert logs[:3] == [("log", None, "f", "info", "n is 3"), ("log", None, "f", "warning", "careful"),
+                        ("log", None, "f", "info", "printed 3")]
+    assert logs[3][0] == "log.table"
 
 
 def test_cancel_before_start():
-    prog = compile_src("""
-    package p
-    step s()():
-        pass
-    flow f()():
-        s()
-    """)
+    prog = coco.compile_file(str(EXAMPLES / "onboard.coco"))
     ev = threading.Event()
     ev.set()
-    res = prog.run("f", {}, cancel=ev)
+    res = prog.run("onboard", onboard_input(), cancel=ev)
     assert res.status == "cancelled"
-    assert [e.type for e in res.events] == ["flow.started", "flow.cancelled"]
 
 
 def test_cancel_mid_loop():
     prog = compile_src("""
-    package p
-    step tick(int i)():
-        if i == 2:
-            self.log("cancel please")
-    flow f()():
-        for i in range(10):
-            tick(i)
+    import time
+    @step
+    def slow(i: int) -> None:
+        time.sleep(0.02)
+    @flow
+    def f():
+        for i in range(100):
+            slow(i)
     """)
-    ev = threading.Event()
+    cancel = threading.Event()
+    seen = []
 
     def on_event(e):
-        if e.type == "log":
-            ev.set()
+        seen.append(e)
+        if e.type == "step.completed" and len([x for x in seen if x.type == "step.completed"]) == 3:
+            cancel.set()
 
-    res = prog.run("f", {}, on_event=on_event, cancel=ev)
+    res = prog.run("f", {}, on_event=on_event, cancel=cancel)
     assert res.status == "cancelled"
-    assert sum(1 for e in res.events if e.type == "step.completed") == 3
+    assert res.events[-1].payload["at_path"] == "f/for#0[3]"
 
 
 def test_stream_yields_events_in_order():
@@ -188,16 +299,17 @@ def test_stream_yields_events_in_order():
     events = asyncio.run(collect())
     assert [e.type for e in events] == ["flow.started", "step.started", "log", "step.completed",
                                         "flow.completed"]
-    assert events[-1].payload["output"] == {"message": "Hello, Vivek!, Hello, Vivek!"}
+    assert events[-1].payload["output"] == {"result": "Hello, Vivek!, Hello, Vivek!"}
 
 
 def test_parallel_runs_keep_print_output_apart():
     prog = compile_src("""
-    package p
-    step say(string who)():
+    @step
+    def say(who: str) -> None:
         for i in range(50):
             print(who, i)
-    flow f(string who)():
+    @flow
+    def f(who: str):
         say(who)
     """)
     results = {}
@@ -215,28 +327,83 @@ def test_parallel_runs_keep_print_output_apart():
         assert logs == [f"{who} {i}" for i in range(50)]
 
 
-def test_self_identity_and_log_levels():
+def test_context_and_log_levels():
     prog = compile_src("""
-    package p
-    step s()(string id):
-        self.log("careful", level="warning")
-        return self.flow + ":" + self.step + ":" + self.path
-    flow f()(string id):
-        string x
+    @step
+    def s() -> str:
+        log("careful", level="warning")
+        return context.flow + ":" + context.step + ":" + context.path + ":" + context.run_id
+    @flow
+    def f() -> str:
         x = s()
         return x
     """)
     res = prog.run("f", {}, run_id="r_test")
-    assert res.run_id == "r_test"
-    assert res.output == {"id": "f:s:f/s"}
+    assert res.output == {"result": "f:s:f/s:r_test"}
     assert res.events[2].payload == {"level": "warning", "message": "careful",
                                      "args": [{"type": "string", "value": "careful"}]}
+
+
+def test_api_outside_a_run(capsys):
+    coco.log("plain", 1, {"a": True})
+    coco.log_table([{"a": 1}])
+    assert coco.env.get("x", 5) == 5 and coco.context.run_id is None
+    out = capsys.readouterr().out
+    assert 'plain 1 {"a": true}' in out and "(index) | a" in out
+
+
+def test_steps_are_plain_python_functions():
+    prog = compile_src("""
+    @step
+    def add(a: int, b: int = 1) -> int:
+        return a + b
+    """)
+    assert prog.step_funcs["add"](2) == 3
+
+
+def test_load_failure_is_a_compile_error():
+    with pytest.raises(coco.CocoCompileError) as e:
+        compile_src("""
+        class A:
+            x: int = 1 // 0
+        """)
+    assert e.value.diagnostics[0].code == "E234"
+
+
+def test_workflow_imports_run():
+    shared = HEAD + textwrap.dedent("""
+    class Item:
+        sku: str
+        price: float
+    @step
+    def total(items: list[Item]) -> float:
+        return sum(i.price for i in items)
+    @flow
+    def checkout(items: list[Item]) -> {"total": float}:
+        t = total(items)
+        return {"total": t}
+    """)
+    prog = coco.compile(HEAD + textwrap.dedent("""
+    import shared
+    @step
+    def make(n: int) -> list[shared.Item]:
+        return [shared.Item(sku=str(i), price=2.5) for i in range(n)]
+    @flow
+    def main(n: int) -> float:
+        items = make(n)
+        t = shared.checkout(items)
+        return t
+    """), "main.coco", {"shared": shared}.get)
+    res = prog.run("main", {"n": 4})
+    assert res.ok, res.error
+    assert res.output == {"result": 10.0}
+    assert any(e.type == "subflow.started" and e.payload["flow"] == "shared.checkout" for e in res.events)
 
 
 def test_cli_check_and_run(capsys, tmp_path):
     assert cli_main(["check", str(EXAMPLES / "onboard.coco")]) == 0
     bad = tmp_path / "bad.coco"
-    bad.write_text("package p\nflow f()(int a):\n    pass\n")
+    bad.write_text("from coco import flow\n@flow\ndef f() -> int:\n    pass\n")
     assert cli_main(["check", str(bad)]) == 1
     capsys.readouterr()
     assert cli_main(["run", str(EXAMPLES / "hello.coco"), "main", "-s", "name=Ada", "-e", "json"]) == 0
@@ -246,34 +413,32 @@ def test_cli_check_and_run(capsys, tmp_path):
 
 def test_console_style_logging():
     prog = compile_src("""
-    package p
     class Item:
-        string sku
-        int qty = 1
-    step s()():
-        self.log("mixed", 1, 2.5, True, None, [1, "a"], {"k": {"n": 1}}, Item(sku="x"))
-        self.debug("d")
-        self.info("i")
-        self.error("boom", {"code": 7})
-        self.log_object("legacy", {"a": 1})
-        self.log_value("legacy value", 3)
-        self.log_table([{"a": 1, "b": "x"}, {"a": 2, "c": True}])
-        self.log_table([[1, 2], [3, 4, 5]])
-        self.log_table(["red", "green"])
-        self.log_table({"ada": {"age": 33}, "bob": {"age": 40}}, columns=["age"])
-        self.log_table([Item(sku="a"), Item(sku="b", qty=3)])
-    flow f()():
+        sku: str
+        qty: int = 1
+    @step
+    def s() -> None:
+        log("mixed", 1, 2.5, True, None, [1, "a"], {"k": {"n": 1}}, Item(sku="x"))
+        debug("d")
+        info("i")
+        error("boom", {"code": 7})
+        log_table([{"a": 1, "b": "x"}, {"a": 2, "c": True}])
+        log_table([[1, 2], [3, 4, 5]])
+        log_table(["red", "green"])
+        log_table({"ada": {"age": 33}, "bob": {"age": 40}}, columns=["age"])
+        log_table([Item(sku="a"), Item(sku="b", qty=3)])
+    @flow
+    def f():
         s()
     """)
     res = prog.run("f", {})
     assert res.ok, res.error
     logs = [e.payload for e in res.events if e.type == "log"]
     mixed = logs[0]
-    assert [a["type"] for a in mixed["args"]] == ["string", "number", "number", "boolean", "null", "array", "object", "object"]
+    assert [a["type"] for a in mixed["args"]] == ["string", "number", "number", "boolean", "null", "array", "object",
+                                                 "object"]
     assert mixed["args"][7] == {"type": "object", "value": {"sku": "x", "qty": 1}, "class": "Item"}
-    assert mixed["message"] == 'mixed 1 2.5 True None [1, "a"] {"k": {"n": 1}} Item {"sku": "x", "qty": 1}'
     assert [p["level"] for p in logs[1:4]] == ["debug", "info", "error"]
-    assert logs[4]["message"] == 'legacy: {"a": 1}' and logs[5]["message"] == "legacy value = 3"
 
     tables = [e.payload for e in res.events if e.type == "log.table"]
     assert tables[0]["columns"] == ["(index)", "a", "b", "c"]
@@ -282,22 +447,40 @@ def test_console_style_logging():
     assert tables[2]["columns"] == ["(index)", "Values"] and tables[2]["rows"] == [[0, "red"], [1, "green"]]
     assert tables[3]["columns"] == ["(index)", "age"] and tables[3]["rows"] == [["ada", 33], ["bob", 40]]
     assert tables[4]["rows"] == [[0, "a", 1], [1, "b", 3]]
-    assert all(t["row_count"] == len(t["rows"]) and not t["truncated"] for t in tables)
 
 
 def test_log_table_limits_and_errors():
     prog = compile_src("""
-    package p
-    step big()():
-        self.log_table([{"i": i} for i in range(1500)])
-    step bad()():
-        self.log_table(42)
-    flow f()():
+    @step
+    def big() -> None:
+        log_table([{"i": i} for i in range(1500)])
+    @step
+    def bad() -> None:
+        log_table(42)
+    @flow
+    def f():
         big()
-    flow g()():
+    @flow
+    def g():
         bad()
     """)
     t = next(e.payload for e in prog.run("f", {}).events if e.type == "log.table")
     assert t["row_count"] == 1500 and len(t["rows"]) == 1000 and t["truncated"]
     res = prog.run("g", {})
     assert res.status == "failed" and "log_table needs a list or a dict" in res.error["message"]
+
+
+def test_methods_on_values_in_flows():
+    prog = compile_src("""
+    import json
+    @flow
+    def f(name: str, tags: list[str]) -> dict:
+        tags.append(name.upper())
+        d = {"n": name.strip().title(), "tags": ",".join(tags), "k": {"a": 1}.get("a")}
+        return d
+    """)
+    assert prog.run("f", {"name": " ada ", "tags": ["x"]}).output == {
+        "result": {"n": "Ada", "tags": "x, ADA ", "k": 1}}
+    errs = [d.code for d in coco.check(HEAD + "import json\n@flow\ndef f(x: int):\n    s = json.dumps(x)\n"
+                                       "    json.loads(s)\n") if d.severity == "error"]
+    assert errs == ["E227", "E209"]

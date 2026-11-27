@@ -16,7 +16,7 @@ PROD = {"user": "svc", "api": {"base_url": "https://api.example.com", "verbose":
 def client(tmp_path):
     s = Settings(db_path=str(tmp_path / "coco.db"), ui_dir=None, wait_timeout_s=10)
     with TestClient(create_app(s)) as c:
-        c.post(f"{API}/workflows", json={"source": (EXAMPLES / "env_demo.coco").read_text()})
+        c.post(f"{API}/workflows", json={"source": (EXAMPLES / "env_demo.coco").read_text(), "name": "env_demo"})
         yield c
 
 

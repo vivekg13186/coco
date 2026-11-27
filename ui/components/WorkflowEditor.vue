@@ -9,17 +9,21 @@ const toast = useToast()
 const { setDirty, setTitle, rekey } = useTabs()
 const { signals } = useSignals()
 
-const TEMPLATE = `package my_workflow
+const TEMPLATE = `from coco import step, flow, log
 
-step hello(string name)(string message):
-    self.log("saying hello to " + name)
-    return "Hello, " + name + "!"
 
-flow main(string name)(string message):
-    string m
-    m = hello(name)
-    return m
+@step
+def hello(name: str) -> str:
+    log("saying hello to", name)
+    return f"Hello, {name}!"
+
+
+@flow
+def main(name: str = "world") -> str:
+    message = hello(name)
+    return message
 `
+const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 
 const isNew = computed(() => props.tab.id.startsWith('new-'))
 const wf = ref<Workflow | null>(null)
@@ -29,7 +33,8 @@ const description = ref('')
 const savedDescription = ref('')
 const diagnostics = ref<Diagnostic[]>([])
 const symbols = ref<Symbols | null>(null)
-const pkg = ref<string | null>(null)
+const name = ref(isNew.value ? 'my_workflow' : '')
+const savedName = ref('')
 const versions = ref<Version[]>([])
 const loading = ref(!isNew.value)
 const saving = ref(false)
@@ -39,7 +44,14 @@ const editor = ref<{ revealLine: (l: number, c?: number) => void } | null>(null)
 const runVisible = ref(false)
 const runFlow = ref<string | null>(null)
 
-const dirty = computed(() => source.value !== savedSource.value || description.value !== savedDescription.value)
+const dirty = computed(() => source.value !== savedSource.value || description.value !== savedDescription.value
+  || name.value !== savedName.value)
+const nameError = computed(() => {
+  const n = name.value.trim()
+  if (!n) return 'A workflow needs a name'
+  if (!NAME_RE.test(n)) return 'Use letters, digits and _ (not starting with a digit), like a Python module name'
+  return null
+})
 const errors = computed(() => diagnostics.value.filter(d => d.severity === 'error'))
 const warnings = computed(() => diagnostics.value.filter(d => d.severity === 'warning'))
 const flows = computed(() => symbols.value?.flows ?? [])
@@ -60,7 +72,8 @@ async function load() {
     savedDescription.value = w.description
     diagnostics.value = w.current_version?.diagnostics ?? []
     symbols.value = w.current_version?.symbols ?? null
-    pkg.value = w.name
+    name.value = w.name
+    savedName.value = w.name
     setTitle(props.tab.key, w.name)
     loadVersions()
   } catch (e: any) {
@@ -84,7 +97,7 @@ watch(() => signals.workflows, () => { if (!dirty.value && wf.value) load() })
 // live check: /validate 500 ms after the last keystroke
 let timer: ReturnType<typeof setTimeout> | null = null
 let seq = 0
-watch(source, () => {
+watch([source, name], () => {
   if (timer) clearTimeout(timer)
   timer = setTimeout(validate, 500)
 })
@@ -93,12 +106,10 @@ async function validate() {
   const mine = ++seq
   checking.value = true
   try {
-    const r = await api.validate(source.value, wf.value?.name)
+    const r = await api.validate(source.value, nameError.value ? null : name.value.trim())
     if (mine !== seq) return
     diagnostics.value = r.diagnostics
     symbols.value = r.symbols
-    pkg.value = r.package
-    if (isNew.value && r.package) setTitle(props.tab.key, `${r.package} (new)`)
   } catch { /* engine offline: keep last results */ } finally {
     if (mine === seq) checking.value = false
   }
@@ -107,16 +118,24 @@ async function validate() {
 async function save() {
   if (saving.value) return
   if (!dirty.value && !isNew.value) return
+  if (nameError.value) {
+    toast.add({ severity: 'warn', summary: 'Check the name', detail: nameError.value, life: 4000 })
+    return
+  }
   saving.value = true
   try {
     let w: Workflow
     if (isNew.value) {
-      w = await api.createWorkflow(source.value, description.value)
+      w = await api.createWorkflow(name.value.trim(), source.value, description.value)
       rekey(props.tab.key, 'wf', w.id, w.name)
     } else {
-      w = await api.saveWorkflow(wf.value!.id, { source: source.value, description: description.value })
+      const body: { source: string; description: string; name?: string } = { source: source.value, description: description.value }
+      if (name.value.trim() !== savedName.value) body.name = name.value.trim()
+      w = await api.saveWorkflow(wf.value!.id, body)
     }
     wf.value = w
+    name.value = w.name
+    savedName.value = w.name
     savedSource.value = source.value
     savedDescription.value = description.value
     diagnostics.value = w.current_version?.diagnostics ?? []
@@ -183,7 +202,9 @@ function startRun(flow?: string) {
   <div class="wf-editor">
     <div class="wf-head row">
       <i class="pi pi-file-edit muted" />
-      <span class="title">{{ wf?.name ?? pkg ?? 'New workflow' }}</span>
+      <InputText v-model="name" size="small" class="name-input mono" placeholder="workflow_name" :invalid="!!nameError"
+                 v-tooltip.bottom="nameError ?? 'Workflow name: other workflows `import` it by this name'"
+                 aria-label="Workflow name" />
       <Tag v-if="current" :value="`v${current.version}`" severity="secondary" />
       <Tag v-if="checking" value="checking…" severity="secondary" icon="pi pi-spin pi-spinner" />
       <Tag v-else-if="errors.length" :value="`${errors.length} error${errors.length > 1 ? 's' : ''}`" severity="danger"
@@ -214,7 +235,7 @@ function startRun(flow?: string) {
           </TabList>
           <TabPanels class="side-panels">
             <TabPanel value="flows"><div class="side-scroll">
-              <div v-if="!flows.length" class="muted pad">No flows yet. Add <code>flow name(inputs)(outputs):</code></div>
+              <div v-if="!flows.length" class="muted pad">No flows yet. Add a function with <code>@flow</code>.</div>
               <div v-for="f in flows" :key="f.name" class="item" @click="jump(f)">
                 <div class="row">
                   <span class="item-name grow">{{ f.name }}</span>
@@ -234,7 +255,7 @@ function startRun(flow?: string) {
                 <div class="section">Classes</div>
                 <div v-for="c in symbols.classes" :key="c.name" class="item" @click="jump(c)">
                   <div class="item-name">{{ c.name }}</div>
-                  <div class="mono muted sig">{{ c.fields.map(x => `${x.type} ${x.name}`).join(', ') }}</div>
+                  <div class="mono muted sig">{{ c.fields.map(x => `${x.name}: ${x.type}`).join(', ') }}</div>
                 </div>
               </template>
             </div></TabPanel>
@@ -290,9 +311,9 @@ function startRun(flow?: string) {
   padding: 0.5rem 1rem;
   border-bottom: 1px solid var(--p-content-border-color);
 }
-.title {
+.name-input {
   font-weight: 700;
-  font-size: 15px;
+  width: 14rem;
 }
 .desc {
   max-width: 28rem;

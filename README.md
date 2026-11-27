@@ -1,7 +1,7 @@
 # COCO
 
-A simple workflow engine for developers who want to automate things. Workflows are written in a small,
-Python-like language instead of a node-based canvas: node editors get cluttered and messy once a workflow
+A simple workflow engine for developers who want to automate things. Workflows are written as plain
+Python files (`@step` and `@flow` functions) instead of a node-based canvas: node editors get cluttered and messy once a workflow
 grows, while code stays readable, diffable and easy to review.
 
 Steps are plain Python, so you can use any Python library you already know for the integration work.
@@ -10,7 +10,7 @@ is easy to back up or move to another machine.
 
 ## Features
 
-* **Workflow language** with a web-based code editor: syntax highlighting, autocompletion, live error
+* **Workflows in plain Python** with a web-based code editor: syntax highlighting, autocompletion, live error
   checking and one-click fixes.
 * **Python inside steps**: use the standard library or any package you install.
 * **Run history**: every run is recorded event by event, so you can inspect it at any time: inputs,
@@ -58,13 +58,14 @@ Useful options (flags or environment variables):
 | `--max-runs N` / `COCO_MAX_RUNS` | `4` | How many runs can execute at the same time |
 | `COCO_API_TOKEN` | off | When set, API calls need `Authorization: Bearer <token>` |
 
-To try the examples, open the UI, go to **Workflows → Import .coco** and pick a file from `examples/`.
+To try the examples, open the UI, go to **Workflows → Import file** and pick a file from `examples/`. The
+workflow is named after the file.
 
 ## Using the UI
 
 | Tab | What it is for |
 | --- | --- |
-| **Workflows** | Your workflows. Create, import a `.coco` file, edit, run, duplicate or delete. |
+| **Workflows** | Your workflows. Create, import a `.coco` or `.py` file, edit, rename, run, duplicate or delete. |
 | **Run History** | Every run with status, duration and environment. Filter, open, rerun or cancel. |
 | **Schedulers** | Placeholder until the scheduler is available. |
 | **Environments** | Named JSON settings. Mark one as the default, or pick one in the top bar. |
@@ -75,39 +76,53 @@ In the editor, **Ctrl/Cmd+S** saves and **Run** asks for the flow's input (as a 
 in its own viewer with four views: **Events** (everything that happened, in order), **Console** (your
 logs), **Steps** (a tree of calls with timings) and **Input / Output**.
 
-## DSL Examples
+## Writing workflows
 
-A `.coco` file has a `package` name (this is also the workflow's name), optional `import`s and `class`es,
-**steps** (plain Python that does the work) and **flows** (which wire steps together).
+A workflow is a plain Python file. You import a few helpers from `coco` and mark functions with two
+decorators:
 
-### Defining simple workflow
+- `@step` marks a function that does the work. A step is ordinary Python, so it can use any library.
+- `@flow` marks a function that wires steps together. Flows are deliberately restricted, which keeps them
+  easy to read and lets the engine record every step, branch and loop iteration.
+
+Because the file is valid Python, any Python editor highlights it, and the built-in editor adds
+autocompletion and live checks. The workflow's name comes from the UI (or from the file name on the
+command line), not from the code. Other workflows `import` it by that name.
+
+### A simple workflow
 
 ```python
-package greetings
+from coco import step, flow, log
+
 
 class Person:
-    string name
-    int age = 0
+    name: str
+    age: int = 0
 
-step greet(Person p)(string message):
+
+@step
+def greet(p: Person) -> str:
+    log("greeting", p.name)
     return "Hello, " + p.name + "!"
 
-step is_adult(Person p)(boolean adult):
+
+@step
+def is_adult(p: Person) -> bool:
     return p.age >= 18
 
-flow main(Person p, int times)(string text):
-    string m
-    boolean adult
-    m = greet(p)
+
+@flow
+def main(p: Person, times: int = 1) -> str:
+    message = greet(p)
     adult = is_adult(p)
     if adult:
-        m = m + " Welcome back."
-    for i in range(1, times, 1):
-        m = m + " Hello again!"
-    return m
+        message = message + " Welcome back."
+    for i in range(times - 1):
+        message = message + " Hello again!"
+    return message
 ```
 
-Run `main` with this input:
+Run `main` with this input (`times` is optional because it has a default):
 
 ```json
 { "p": { "name": "Ada", "age": 36 }, "times": 2 }
@@ -115,18 +130,45 @@ Run `main` with this input:
 
 How it fits together:
 
-- **Types**: `string`, `boolean`, `int`, `float`, `object` (a dict), `array` (a list), your own classes, and
-  arrays such as `Person people[]`. Inputs and outputs are checked against them.
-- **Steps**: `step name(inputs)(outputs):` followed by Python. `return a, b` returns several outputs, in order.
-- **Flows**: `flow name(inputs)(outputs):` can only do these things:
-  - declare variables (`string m`, `int n = 0`)
-  - call steps and other flows (`x = step(a)`, `(x, y) = step(a)`)
-  - assign simple expressions (`count = count + 1`)
-  - use `if` / `elif` / `else`, `for i in range(...)` and `for p in people`
+- **Inputs** are the function's parameters. Type hints work as in Python: `str`, `int`, `float`, `bool`,
+  `dict`, `list[T]`, `T | None` (or `Optional[T]`), `Any`, and your own classes. Inputs are checked and
+  converted when a run starts and when a step is called (`"3"` becomes `3` for an `int`). A parameter without
+  a hint accepts anything, and a type the engine doesn't know is treated as `Any`. Defaults make an input
+  optional.
+- **Outputs** come from the `->` hint:
+
+  | Hint | Outputs |
+  | --- | --- |
+  | `-> str` | one output, named `result` |
+  | `-> {"total": int, "ok": bool}` | named outputs; return a dict with those keys (or a tuple in that order) |
+  | `-> tuple[int, str]` | two outputs, `result1` and `result2` |
+  | `-> None` | no outputs |
+  | no hint | whatever the step returns |
+
+  A flow without a hint gets its outputs from its `return`: `return {"url": u, "retries": r}` gives the
+  outputs `url` and `retries`.
+- **Classes** are data shapes: write fields with type hints, and Coco turns the class into a validated model
+  (a pydantic model). Use them as input and output types.
+- **Flows** can only do these things:
+  - assign values (`count = 0`, `total: float = 0`, `count += 1`); a variable is created when first assigned
+  - call steps and other flows as statements: `x = step(a)`, `a, b = step(x)`, `step(x)`
+  - use simple expressions, builtins such as `len`, `min`, `round`, `sorted`, and methods on values
+    (`name.upper()`, `items.get("k")`)
+  - `if` / `elif` / `else`, `for i in range(...)`, `for item in items`, `for i, x in enumerate(items)`,
+    `break` and `continue`
+  - `log(...)`, `warn(...)`, `log_table(...)` and `print(...)`
+  - read `env` and module constants
   - `return`
 
-  Anything else belongs in a step.
+  Anything else (`while`, `try`, calling a library, creating objects) belongs in a step. The editor tells you
+  when something isn't allowed in a flow.
 - **Sub-flows**: a flow can call another flow like a step; flows cannot call themselves.
+- **Helpers**: plain functions (without a decorator) and constants at the top of the file can be used by
+  steps. A flow can't call a helper; add `@step` to it if a flow needs it.
+- **Top-level code**: only imports, classes, functions and constants are allowed at the top level, so
+  loading a workflow never runs anything by itself.
+- Type mismatches in flows are warnings, not errors, just as in Python. Errors (an unknown step, wrong
+  number of arguments, a `while` in a flow) stop a workflow from running until they are fixed.
 - Python spells values `True`, `False` and `None` (not `true` / `false` / `null`). The editor flags the JSON
   spellings and offers a fix.
 
@@ -138,22 +180,25 @@ Create an environment in the **Environments** tab, for example `dev`:
 { "user": "vivek", "retries": 5, "api": { "base_url": "https://dev.example.com", "verbose": true } }
 ```
 
-Then read it with `env` in flows and `self.env` in steps:
+Then read it with `env`, in steps and in flows:
 
 ```python
-package env_demo
+from coco import step, flow, log, env
 
-step build_url(string path)(string url):
-    return self.env.api.base_url + path         # in a step: self.env
 
-flow main(string path)(string url, int retries):
-    string u
-    int r
-    u = build_url(path)
-    r = env.get("retries", 3)                   # in a flow: env.key, env["key"], env.get(key, default)
+@step
+def build_url(path: str) -> str:
+    log("building a url for", env.user)
+    return env.api.base_url + path
+
+
+@flow
+def main(path: str = "/") -> {"url": str, "retries": int}:
+    url = build_url(path)
+    retries = env.get("retries", 3)             # env.key, env["key"], env.get(key, default)
     if env.api.verbose:
-        u = u + "?verbose=1"
-    return u, r
+        url = url + "?verbose=1"
+    return {"url": url, "retries": retries}
 ```
 
 - Pick the environment for new runs in the top bar (or per run in the Run dialog). The default environment
@@ -162,23 +207,27 @@ flow main(string path)(string url, int retries):
 - Run events record the environment's **name**, never its values. Values are stored unencrypted in the
   SQLite file, so keep real production secrets elsewhere.
 
-### How to use log statement
+### How to use log statements
 
 ```python
-package orders
+from coco import step, flow, log, warn, log_table
 
-step check(object order)(boolean ok):
-    self.log("checking order", order["id"], order)       # any number of values, like console.log
+
+@step
+def check(order: dict) -> bool:
+    log("checking order", order["id"], order)       # any number of values, like console.log
     if order["total"] > 1000:
-        self.warn("large order:", order["total"])        # also: self.info, self.error, self.debug
-    self.log_table(order["lines"])                       # a list of rows, shown as a table
-    print("print() works too")                           # becomes a log line
+        warn("large order:", order["total"])        # also: info, error, debug
+    log_table(order["lines"])                       # a list of rows, shown as a table
+    print("print() works too")                      # becomes a log line
     return order["total"] > 0
 
-flow main(object order)(boolean ok):
-    boolean r
-    r = check(order)
-    return r
+
+@flow
+def main(order: dict) -> bool:
+    ok = check(order)
+    log("result:", ok)                              # flows can log too
+    return ok
 ```
 
 Input:
@@ -189,34 +238,39 @@ Input:
 
 Logs appear in the run viewer's **Console** view, in order. Objects can be expanded like in the browser
 console. Tables (`log_table` takes a list of objects, lists or values, a dict of rows or a pandas
-DataFrame) can be filtered by text and sorted by clicking a column header. `self.error(...)` only logs; to
-fail a step, raise an exception.
+DataFrame) can be filtered by text and sorted by clicking a column header. `error(...)` only logs; to fail a
+step, raise an exception. `context.run_id`, `context.flow`, `context.step` and `context.path` tell a step
+where it is running. Outside a run (for example when you call a step function in a test), `log` simply
+prints.
 
-### How to use python function and library
+### How to use Python functions and libraries
 
 Imports go at the top of the file and are available in every step:
 
 ```python
-package weather_report
 import json
 import statistics
 from datetime import date
 
-step summarize(string raw)(object report):
+from coco import step, flow, log_table
+
+
+@step
+def summarize(raw: str) -> dict:
     readings = json.loads(raw)                       # standard library
     temps = [r["temp"] for r in readings]
-    report = {
+    log_table(readings)
+    return {
         "day": date.today().isoformat(),
         "avg": round(statistics.mean(temps), 1),
         "max": max(temps),
     }
-    self.log_table(readings)
-    return report
 
-flow main(string raw)(object report):
-    object r
-    r = summarize(raw)
-    return r
+
+@flow
+def main(raw: str) -> dict:
+    report = summarize(raw)
+    return report
 ```
 
 Input:
@@ -236,18 +290,23 @@ pip install requests
 ```python
 import requests
 
-step fetch(string url)(object data):
+from coco import step
+
+
+@step
+def fetch(url: str) -> dict:
     response = requests.get(url, timeout=10)
     response.raise_for_status()
     return response.json()
 ```
 
-You can also import another Coco workflow by its package name (`import shared`) and call its steps and
-flows as `shared.step_name(...)`.
+You can also import another workflow by its name (`import shared`), call its steps and flows from a flow
+as `shared.step_name(...)`, and use its classes as `shared.ClassName`.
 
 ## Command line
 
-The `coco` command checks and runs `.coco` files without the engine, which is handy while writing them:
+The `coco` command checks and runs workflow files without the engine, which is handy while writing them
+(the workflow is named after the file, and `import other` finds `other.coco` or `other.py` next to it):
 
 ```bash
 coco check examples/onboard.coco
@@ -272,7 +331,7 @@ curl -X POST http://127.0.0.1:8765/api/v1/workflows/hello/flows/main/runs \
 
 | Folder | Contents |
 | --- | --- |
-| `core/` | The language: parser, checker, runtime and the `coco` command ([details](core/README.md)) |
+| `core/` | The workflow core: parser, checker, runtime, the `coco` API and command ([details](core/README.md)) |
 | `server/` | The engine: REST API, SQLite storage, run worker and `coco-server` ([details](server/README.md)) |
 | `ui/` | The web UI source: Nuxt, PrimeVue and the Monaco editor ([details](ui/README.md)) |
 | `server/coco_server/ui/` | The built web UI, generated by `npm run build` in `ui/` and committed so nobody has to build it |

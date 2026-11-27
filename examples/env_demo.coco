@@ -1,17 +1,21 @@
-# Reads its settings from the run environment: `env` in flows, `self.env` in steps.
-# Try: coco run examples/env_demo.coco main -s path=/users --env examples/dev.env.json
-package env_demo
+"""Reads its settings from the run environment with `env`, in flows and in steps.
 
-step build_url(string path)(string url):
-    self.log("building a url for", self.env.user)
-    self.log("api settings:", self.env.api)
-    return self.env.api.base_url + path
+Try: coco run examples/env_demo.coco main -s path=/users --env examples/dev.env.json
+"""
+from coco import step, flow, log, env
 
-flow main(string path)(string url, int retries):
-    string u
-    int r
-    u = build_url(path)
-    r = env.get("retries", 3)
+
+@step
+def build_url(path: str) -> str:
+    log("building a url for", env.user)
+    log("api settings:", env.api)
+    return env.api.base_url + path
+
+
+@flow
+def main(path: str = "/") -> {"url": str, "retries": int}:
+    url = build_url(path)
+    retries = env.get("retries", 3)
     if env.api.verbose:
-        u = u + "?verbose=1"
-    return u, r
+        url = url + "?verbose=1"
+    return {"url": url, "retries": retries}

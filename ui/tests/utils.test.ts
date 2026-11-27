@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { buildRunTree } from '../utils/runTree'
 import { category, detail, matches } from '../utils/events'
 import { duration, signature } from '../utils/format'
+import { defaultInput, isScalar } from '../utils/inputs'
 import type { CocoEvent } from '../types/api'
 
 let seq = 0
@@ -17,9 +18,24 @@ describe('format', () => {
     expect(duration(125_000)).toBe('2 m 5 s')
     expect(duration(null)).toBe('—')
   })
-  it('formats signatures', () => {
+  it('formats Python-style signatures', () => {
     expect(signature({ inputs: [{ name: 't', type: 'Team' }], outputs: [{ name: 'n', type: 'int' }] }))
-      .toBe('(Team t) → (int n)')
+      .toBe('(t: Team) -> {"n": int}')
+    expect(signature({ inputs: [{ name: 'name', type: 'str', optional: true, default: 'x' }], outputs: [{ name: 'result', type: 'str' }] }))
+      .toBe('(name: str = "x") -> str')
+    expect(signature({ inputs: [], outputs: [{ name: 'result1', type: 'int' }, { name: 'result2', type: 'str' }] }))
+      .toBe('() -> tuple[int, str]')
+    expect(signature({ inputs: [], outputs: [] })).toBe('() -> None')
+    expect(signature({ inputs: [], outputs: null })).toBe('()')
+  })
+  it('builds default flow inputs from Python types', () => {
+    const classes = [{ name: 'P', line: 1, fields: [{ name: 'name', type: 'str' }, { name: 'tags', type: 'list[str]' }, { name: 'nick', type: 'str | None' }] }]
+    expect(defaultInput([
+      { name: 'p', type: 'P' }, { name: 'n', type: 'int', optional: true, default: 3 }, { name: 'ok', type: 'bool' },
+      { name: 'x', type: 'Any' }, { name: 'd', type: 'dict' },
+    ], classes)).toEqual({ p: { name: '', tags: [], nick: null }, n: 3, ok: false, x: null, d: {} })
+    expect(isScalar('int | None')).toBe(true)
+    expect(isScalar('list[int]')).toBe(false)
   })
 })
 

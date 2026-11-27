@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import io
 import sys
 import threading
@@ -12,7 +13,10 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from pydantic import ValidationError
 
-from .checker import AssignIR, BUILTINS, CallIR, DeclIR, FlowIR, ForIR, IfIR, ReturnIR
+from .checker import (AssignIR, ExprIR, BUILTINS, BreakIR, CallIR, ContinueIR, DeclIR, FlowIR, ForIR, IfIR, LogIR,
+                      ReturnIR, is_tuple_outputs)
+from . import dsl
+from .dsl import _local
 from .diagnostics import CocoRuntimeError
 from .env import EnvView
 from .events import Event, RunResult, now_iso
@@ -27,7 +31,6 @@ LOG_LEVELS = ("debug", "info", "warning", "error")
 
 
 # ---------------------------------------------------------------- print() capture
-_local = threading.local()
 
 
 class _StdoutRouter(io.TextIOBase):
@@ -58,11 +61,11 @@ def _install_print_capture() -> None:
         sys.stdout = _StdoutRouter(sys.stdout)
 
 
-# ---------------------------------------------------------------- self in steps
+# ---------------------------------------------------------------- the running step
 class StepContext:
-    """The `self` object every step body receives."""
+    """Where code is running: what `log`, `env` and `context` use. One per step call (step=None in flows)."""
 
-    def __init__(self, execution: "Execution", flow: str, step: str, path: str):
+    def __init__(self, execution: "Execution", flow: str, step: str | None, path: str):
         self._ex = execution
         self._flow = flow
         self._step = step
@@ -75,15 +78,15 @@ class StepContext:
 
     @property
     def env(self) -> EnvView:
-        """The run environment (read-only): `self.env.api_url` or `self.env["api_url"]`."""
+        """The run environment (read-only): `env.api_url` or `env["api_url"]`."""
         return self._ex.env
 
     @property
-    def flow(self) -> str:
+    def flow(self) -> str | None:
         return self._flow
 
     @property
-    def step(self) -> str:
+    def step(self) -> str | None:
         return self._step
 
     @property
@@ -92,7 +95,7 @@ class StepContext:
 
     # -- console-style logging: any number of values of any type, like console.log
     def log(self, *values: Any, level: str = "info") -> None:
-        """Log any values: `self.log("total", n, {"a": 1}, True)`. Objects keep their structure."""
+        """Log any values: `log("total", n, {"a": 1}, True)`. Objects keep their structure."""
         if level not in LOG_LEVELS:
             raise ValueError(f"log level must be one of {', '.join(LOG_LEVELS)}")
         args = [log_arg(v) for v in values]
@@ -122,13 +125,6 @@ class StepContext:
                       message=f"table: {table['row_count']} row(s) x {len(table['columns']) - 1} column(s)",
                       **table)
 
-    # kept so workflows written before console-style logging still run; not documented
-    def log_value(self, name: str, value: Any) -> None:
-        self.log(f"{name} =", value)
-
-    def log_object(self, name: str, obj: Any) -> None:
-        self.log(f"{name}:", obj)
-
     def _flush(self) -> None:
         if self._buffer:
             line, self._buffer = self._buffer, ""
@@ -152,8 +148,16 @@ class _Failure(Exception):
 
 
 class _Return(Exception):
-    def __init__(self, values: list[Any]):
+    def __init__(self, values: dict[str, Any]):
         self.values = values
+
+
+class _Break(Exception):
+    pass
+
+
+class _Continue(Exception):
+    pass
 
 
 def _err(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -178,7 +182,7 @@ class Execution:
             raise TypeError("env must be a JSON object (dict)")
         self.env = EnvView(env or {})
         self.env_name = env_name
-        self._globals = {"__builtins__": SAFE_BUILTINS, "env": self.env}
+        self._globals: dict[int, dict[str, Any]] = {}
         self.run_id = run_id or "r_" + uuid.uuid4().hex[:12]
         self.on_event = on_event
         self.cancel = cancel or threading.Event()
@@ -186,6 +190,13 @@ class Execution:
         self.events: list[Event] = []
         self._seq = 0
         self._lock = threading.Lock()
+
+    def globals_for(self, prog: "Program") -> dict[str, Any]:
+        g = self._globals.get(id(prog))
+        if g is None:
+            g = {**prog.constants, "__builtins__": SAFE_BUILTINS, "env": self.env, "context": dsl.context}
+            self._globals[id(prog)] = g
+        return g
 
     # -- events
     def emit(self, type_: str, path: str | None = None, step: str | None = None, **payload: Any) -> Event:
@@ -216,11 +227,11 @@ class Execution:
         try:
             ir = prog.flow_irs.get(flow_name)
             if ir is None:
-                raise _Failure(_err("unknown_flow", f"no flow named `{flow_name}` in package "
+                raise _Failure(_err("unknown_flow", f"no flow named `{flow_name}` in workflow "
                                                     f"`{prog.name}`"), flow_name)
             args = self._bind_inputs(prog, ir, inputs or {}, flow_name)
-            values = self._exec_flow(prog, ir, args, flow_name)
-            output = {o.name: to_jsonable(v) for o, v in zip(ir.outputs, values)}
+            values = self._exec_flow(prog, ir, args, flow_name, flow_name)
+            output = {k: to_jsonable(v) for k, v in values.items()}
             status = "succeeded"
             self.emit("flow.completed", flow_name, None, output=output, duration_ms=self._ms(t0))
         except _Cancelled as c:
@@ -240,12 +251,12 @@ class Execution:
     def _ms(t0: float) -> int:
         return int((time.perf_counter() - t0) * 1000)
 
-    def _bind_inputs(self, prog: "Program", ir: FlowIR, inputs: dict[str, Any], path: str) -> list[Any]:
+    def _bind_inputs(self, prog: "Program", ir: FlowIR, inputs: dict[str, Any], path: str) -> dict[str, Any]:
         if not isinstance(inputs, dict):
             raise _Failure(_err("invalid_input", "flow input must be an object"), path)
         names = [p.name for p in ir.params]
         unknown = [k for k in inputs if k not in names]
-        missing = [n for n in names if n not in inputs]
+        missing = [p.name for p in ir.params if p.name not in inputs and not p.has_default]
         if unknown or missing:
             msg = []
             if missing:
@@ -253,8 +264,18 @@ class Execution:
             if unknown:
                 msg.append("unknown input(s): " + ", ".join(unknown))
             raise _Failure(_err("invalid_input", "; ".join(msg)), path)
-        return [self._validate(prog, p.type, inputs[p.name], f"input `{p.name}`", path, "invalid_input")
-                for p in ir.params]
+        return self._typed_args(prog, ir, inputs, path, f"flow `{ir.name}`")
+
+    def _typed_args(self, prog: "Program", ir: FlowIR, given: dict[str, Any], path: str,
+                    what: str) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for p in ir.params:
+            if p.name in given:
+                out[p.name] = self._validate(prog, p.type, given[p.name], f"input `{p.name}` of {what}", path,
+                                             "invalid_input")
+            else:
+                out[p.name] = copy.deepcopy(p.default)
+        return out
 
     def _validate(self, prog: "Program", t, value: Any, what: str, path: str, code: str) -> Any:
         try:
@@ -263,22 +284,27 @@ class Execution:
             raise _Failure(_err(code, f"{what} is not a valid {t}: {_validation_message(e)}"), path)
 
     # -- flows
-    def _exec_flow(self, prog: "Program", ir: FlowIR, args: list[Any], path: str) -> list[Any]:
-        frame: dict[str, Any] = {p.name: a for p, a in zip(ir.params, args)}
+    def _exec_flow(self, prog: "Program", ir: FlowIR, args: dict[str, Any], path: str,
+                   label: str) -> dict[str, Any]:
+        frame: dict[str, Any] = dict(args)
         for name in ir.decls:
             frame.setdefault(name, None)
+        prev = getattr(_local, "ctx", None)
+        _local.ctx = StepContext(self, label, None, path)
         try:
             self._block(prog, ir.body, frame, path)
         except _Return as r:
-            return [self._validate(prog, o.type, v, f"output `{o.name}` of flow `{ir.name}`", path,
-                                   "invalid_output") for o, v in zip(ir.outputs, r.values)]
+            return {o.name: self._validate(prog, o.type, r.values.get(o.name), f"output `{o.name}` of flow "
+                                           f"`{label}`", path, "invalid_output") for o in ir.outputs}
+        finally:
+            _local.ctx = prev
         if ir.outputs:
-            raise _Failure(_err("no_return", f"flow `{ir.name}` ended without `return`"), path)
-        return []
+            raise _Failure(_err("no_return", f"flow `{label}` ended without `return`"), path)
+        return {}
 
     def _eval(self, prog: "Program", code, frame: dict[str, Any], path: str, line: int) -> Any:
         try:
-            return eval(code, self._globals, frame)
+            return eval(code, self.globals_for(prog), frame)
         except Exception as e:
             raise _Failure(_err("expression_error", f"line {line}: {type(e).__name__}: {e}", line=line), path)
 
@@ -287,15 +313,16 @@ class Execution:
             if self.cancel.is_set():
                 raise _Cancelled(path)
             if isinstance(st, DeclIR):
-                continue
-            if isinstance(st, AssignIR):
-                value = self._eval(prog, st.expr, frame, path, st.line)
-                if st.type is not None:
-                    value = self._validate(prog, st.type, value, f"`{st.target}` (line {st.line})", path,
-                                           "type_error")
-                frame[st.target] = value
+                if st.value is not None:
+                    frame[st.names[0][0]] = self._eval(prog, st.value, frame, path, st.line)
+            elif isinstance(st, ExprIR):
+                self._eval(prog, st.expr, frame, path, st.line)
+            elif isinstance(st, AssignIR):
+                frame[st.target] = self._eval(prog, st.expr, frame, path, st.line)
             elif isinstance(st, CallIR):
                 self._call(prog, st, frame, path)
+            elif isinstance(st, LogIR):
+                self._log(prog, st, frame, path)
             elif isinstance(st, IfIR):
                 for arm, cond, body in st.branches:
                     if cond is None or self._eval(prog, cond, frame, path, st.line):
@@ -303,74 +330,136 @@ class Execution:
                         self._block(prog, body, frame, f"{path}/{st.id}.{arm}")
                         break
             elif isinstance(st, ForIR):
-                if st.range_args is not None:
-                    rargs = [self._eval(prog, a, frame, path, st.line) for a in st.range_args]
-                    try:
-                        items = range(*rargs)
-                    except TypeError as e:
-                        raise _Failure(_err("expression_error", f"line {st.line}: range(): {e}"), path)
-                else:
-                    items = self._eval(prog, st.iterable, frame, path, st.line)
-                for i, item in enumerate(items):
-                    if self.cancel.is_set():
-                        raise _Cancelled(f"{path}/{st.id}[{i}]")
-                    frame[st.var] = item
-                    self.emit("loop.iteration", f"{path}/{st.id}", None, index=i, value=to_jsonable(item))
-                    self._block(prog, st.body, frame, f"{path}/{st.id}[{i}]")
+                self._for(prog, st, frame, path)
+            elif isinstance(st, BreakIR):
+                raise _Break()
+            elif isinstance(st, ContinueIR):
+                raise _Continue()
             elif isinstance(st, ReturnIR):
-                raise _Return([self._eval(prog, v, frame, path, st.line) for v in st.values])
+                raise _Return({name: self._eval(prog, v, frame, path, st.line) for name, v in st.values})
+
+    def _for(self, prog: "Program", st: ForIR, frame: dict[str, Any], path: str) -> None:
+        if st.range_args is not None:
+            rargs = [self._eval(prog, a, frame, path, st.line) for a in st.range_args]
+            try:
+                items: Any = range(*rargs)
+            except TypeError as e:
+                raise _Failure(_err("expression_error", f"line {st.line}: range(): {e}"), path)
+        else:
+            items = self._eval(prog, st.iterable, frame, path, st.line)
+        try:
+            iterator = iter(items)
+        except TypeError as e:
+            raise _Failure(_err("expression_error", f"line {st.line}: {e}", line=st.line), path)
+        for i, item in enumerate(iterator):
+            if self.cancel.is_set():
+                raise _Cancelled(f"{path}/{st.id}[{i}]")
+            if isinstance(st.var, list):
+                try:
+                    parts = list(item)
+                except TypeError:
+                    parts = [item]
+                if len(parts) != len(st.var):
+                    raise _Failure(_err("expression_error", f"line {st.line}: cannot unpack {len(parts)} "
+                                                            f"value(s) into {', '.join(st.var)}", line=st.line), path)
+                frame.update(zip(st.var, parts))
+            else:
+                frame[st.var] = item
+            self.emit("loop.iteration", f"{path}/{st.id}", None, index=i, value=to_jsonable(item))
+            try:
+                self._block(prog, st.body, frame, f"{path}/{st.id}[{i}]")
+            except _Continue:
+                continue
+            except _Break:
+                break
+
+    def _log(self, prog: "Program", st: LogIR, frame: dict[str, Any], path: str) -> None:
+        args = [self._eval(prog, a, frame, path, st.line) for a in st.args]
+        kwargs = {k: self._eval(prog, v, frame, path, st.line) for k, v in st.kwargs.items()}
+        ctx = StepContext(self, path.split("/")[0], None, path)
+        prev = getattr(_local, "ctx", None)
+        _local.ctx = ctx
+        try:
+            if st.func == "print":
+                sep = kwargs.get("sep", " ")
+                ctx.log(sep.join(str(a) for a in args))
+            else:
+                getattr(dsl, st.func)(*args, **kwargs)
+        except Exception as e:
+            raise _Failure(_err("expression_error", f"line {st.line}: {st.func}(): {type(e).__name__}: {e}",
+                                line=st.line), path)
+        finally:
+            _local.ctx = prev
 
     def _call(self, prog: "Program", st: CallIR, frame: dict[str, Any], path: str) -> None:
         callee = st.callee
         target_prog = prog.imports[callee.package] if callee.package else prog
-        raw = [self._eval(prog, a, frame, path, st.line) for a in st.args]
-        if st.kwargs:
-            names = [p.name for p in callee.params]
-            byname = dict(zip(names, raw))
-            for k, code in st.kwargs.items():
-                byname[k] = self._eval(prog, code, frame, path, st.line)
-            raw = [byname[n] for n in names]
+        names = [p.name for p in callee.params]
+        given = {n: self._eval(prog, a, frame, path, st.line) for n, a in zip(names, st.args)}
+        for k, code in st.kwargs.items():
+            given[k] = self._eval(prog, code, frame, path, st.line)
         cpath = f"{path}/{callee.label}"
         if callee.kind == "step":
-            values = self._call_step(target_prog, callee.name, callee.label, raw, cpath, path)
+            raw, values = self._call_step(target_prog, callee.name, callee.label, given, cpath, path)
         else:
-            values = self._call_subflow(target_prog, callee.name, callee.label, raw, cpath)
-        if st.targets:
+            values = self._call_subflow(target_prog, callee.name, callee.label, given, cpath)
+            raw = None
+        if not st.targets:
+            return
+        outs = callee.outputs
+        if outs is None:  # a step without `->`: plain Python assignment of whatever it returned
             if len(st.targets) == 1:
-                frame[st.targets[0]] = values[0]
+                frame[st.targets[0]] = raw
+                return
+            try:
+                parts = list(raw)
+            except TypeError:
+                parts = [raw]
+            if len(parts) != len(st.targets):
+                raise _Failure(_err("invalid_output", f"line {st.line}: `{callee.label}` returned {len(parts)} "
+                                                      f"value(s), expected {len(st.targets)}"), cpath)
+            frame.update(zip(st.targets, parts))
+            return
+        if len(st.targets) == 1:
+            if len(outs) == 1:
+                frame[st.targets[0]] = values[outs[0].name]
+            elif is_tuple_outputs(outs):
+                frame[st.targets[0]] = [values[o.name] for o in outs]
             else:
-                for t, v in zip(st.targets, values):
-                    frame[t] = v
+                frame[st.targets[0]] = dict(values)
+            return
+        for t, o in zip(st.targets, outs):
+            frame[t] = values[o.name]
 
-    def _call_subflow(self, prog: "Program", name: str, label: str, raw: list[Any], path: str) -> list[Any]:
+    def _call_subflow(self, prog: "Program", name: str, label: str, given: dict[str, Any],
+                      path: str) -> dict[str, Any]:
         ir = prog.flow_irs[name]
         t0 = time.perf_counter()
-        self.emit("subflow.started", path, None, flow=label,
-                  input={p.name: to_jsonable(v) for p, v in zip(ir.params, raw)})
-        args = [self._validate(prog, p.type, v, f"input `{p.name}` of flow `{label}`", path, "invalid_input")
-                for p, v in zip(ir.params, raw)]
-        values = self._exec_flow(prog, ir, args, path)
+        self.emit("subflow.started", path, None, flow=label, input={k: to_jsonable(v) for k, v in given.items()})
+        args = self._typed_args(prog, ir, given, path, f"flow `{label}`")
+        values = self._exec_flow(prog, ir, args, path, label)
         self.emit("subflow.completed", path, None, flow=label,
-                  output={o.name: to_jsonable(v) for o, v in zip(ir.outputs, values)},
-                  duration_ms=self._ms(t0))
+                  output={k: to_jsonable(v) for k, v in values.items()}, duration_ms=self._ms(t0))
         return values
 
-    def _call_step(self, prog: "Program", name: str, label: str, raw: list[Any], path: str,
-                   flow_path: str) -> list[Any]:
-        sdef = prog.package.steps_by_name[name]
+    def _call_step(self, prog: "Program", name: str, label: str, given: dict[str, Any], path: str,
+                   flow_path: str) -> tuple[Any, dict[str, Any]]:
+        sdef = prog.module.steps_by_name[name]
         func = prog.step_funcs[name]
         flow_name = flow_path.split("/")[0]
-        self.emit("step.started", path, label, input={p.name: to_jsonable(v) for p, v in zip(sdef.params, raw)})
+        self.emit("step.started", path, label, input={k: to_jsonable(v) for k, v in given.items()})
         t0 = time.perf_counter()
 
         def fail(error: dict[str, Any]) -> _Failure:
             self.emit("step.failed", path, label, error=error, duration_ms=self._ms(t0))
             return _Failure(error, path)
 
-        args = []
-        for p, v in zip(sdef.params, raw):
+        kwargs: dict[str, Any] = {}
+        for p in sdef.params:
+            if p.name not in given:
+                continue  # the step's own Python default applies
             try:
-                args.append(prog.adapter(p.type).validate_python(v))
+                kwargs[p.name] = prog.adapter(p.type).validate_python(given[p.name])
             except ValidationError as e:
                 raise fail(_err("invalid_input", f"input `{p.name}` of step `{label}` is not a valid "
                                                  f"{p.type}: {_validation_message(e)}"))
@@ -378,7 +467,7 @@ class Execution:
         prev = getattr(_local, "ctx", None)
         _local.ctx = ctx
         try:
-            result = func(ctx, *args)
+            result = func(**kwargs)
         except Exception as e:
             ctx._flush()
             raise fail(_err("step_error", f"{type(e).__name__}: {e}", exception=type(e).__name__,
@@ -387,27 +476,39 @@ class Execution:
             _local.ctx = prev
         ctx._flush()
 
-        n = len(sdef.outputs)
+        outs = sdef.outputs
+        if outs is None:
+            self.emit("step.completed", path, label,
+                      output={} if result is None else {"result": to_jsonable(result)}, duration_ms=self._ms(t0))
+            return result, {"result": result}
+        n = len(outs)
+        names = [o.name for o in outs]
         if n == 0:
             values: list[Any] = []
-        elif n == 1:
+        elif n == 1 and not (names[0] != "result" and isinstance(result, dict) and names[0] in result):
             values = [result]
+        elif isinstance(result, dict) and not is_tuple_outputs(outs):
+            missing = [k for k in names if k not in result]
+            if missing:
+                raise fail(_err("invalid_output", f"step `{label}` must return a dict with "
+                                                  f"{', '.join(names)}; missing {', '.join(missing)}"))
+            values = [result[k] for k in names]
         elif isinstance(result, (tuple, list)) and len(result) == n:
             values = list(result)
         else:
             got = f"{len(result)} values" if isinstance(result, (tuple, list)) else type_name(result)
-            raise fail(_err("invalid_output", f"step `{label}` must return {n} values "
-                                              f"({', '.join(o.name for o in sdef.outputs)}), got {got}"))
-        out = []
-        for o, v in zip(sdef.outputs, values):
+            shape = f"a dict with {', '.join(names)}" if not is_tuple_outputs(outs) else f"{n} values"
+            raise fail(_err("invalid_output", f"step `{label}` must return {shape}, got {got}"))
+        out: dict[str, Any] = {}
+        for o, v in zip(outs, values):
             try:
-                out.append(prog.adapter(o.type).validate_python(v))
+                out[o.name] = prog.adapter(o.type).validate_python(v)
             except ValidationError as e:
                 raise fail(_err("invalid_output", f"output `{o.name}` of step `{label}` is not a valid "
                                                   f"{o.type}: {_validation_message(e)}"))
-        self.emit("step.completed", path, label, output={o.name: to_jsonable(v) for o, v in zip(sdef.outputs, out)},
+        self.emit("step.completed", path, label, output={k: to_jsonable(v) for k, v in out.items()},
                   duration_ms=self._ms(t0))
-        return out
+        return result, out
 
 
 def _step_traceback(e: BaseException, filename: str) -> str:

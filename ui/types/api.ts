@@ -14,14 +14,16 @@ export interface Diagnostic {
 
 export interface Param {
   name: string
-  type: string
+  type: string            // Python-style: str, int, float, bool, dict, Any, list[T], T | None, or a class
+  default?: unknown
+  optional?: boolean      // has a default
 }
 
 export interface Signature {
   name: string
   line: number
   inputs: Param[]
-  outputs: Param[]
+  outputs: Param[] | null // null: a step without `->` (returns whatever it returns)
 }
 
 export interface ClassSymbol {
@@ -31,12 +33,13 @@ export interface ClassSymbol {
 }
 
 export interface Symbols {
-  package: string | null
+  workflow: string
   classes: ClassSymbol[]
   steps: Signature[]
   flows: Signature[]
   imports: { module: string; alias: string | null; names: string[]; kind: 'coco' | 'python' }[]
-  self: string[]
+  helpers: string[]
+  globals: string[]
 }
 
 export interface Version {
@@ -135,7 +138,6 @@ export interface EventPage {
 }
 
 export interface ValidateResult {
-  package: string | null
   is_valid: boolean
   diagnostics: Diagnostic[]
   flows: Signature[]
